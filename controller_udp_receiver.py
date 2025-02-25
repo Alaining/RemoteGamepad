@@ -4,11 +4,11 @@ import pyvjoy
 import math
 
 # Configuration
-UDP_IP = "::"  # Listen on all available IPv6 interfaces
+UDP_IP = "0.0.0.0"  # Listen on all available interfaces
 UDP_PORT = 5005
 
-# Create an IPv6 UDP socket
-sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+# Create an UDP socket
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind((UDP_IP, UDP_PORT))
 
 # Initialize vJoy device (Assuming ID 1)

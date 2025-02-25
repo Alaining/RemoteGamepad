@@ -10,13 +10,13 @@ UDP_PORT = 5005
 DEADZONE = 0.01
 PRINT_UPDATES = True
 
-# Validate the IPv6 address (basic check)
-if not UDP_IP or ":" not in UDP_IP:
-    print("Invalid IPv6 address. Exiting...")
-    exit()
+# # Validate the IPv6 address (basic check)
+# if not UDP_IP or ":" not in UDP_IP:
+#     print("Invalid IPv6 address. Exiting...")
+#     exit()
     
 # Create an IPv6 UDP socket
-sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 json_text = """
 {
