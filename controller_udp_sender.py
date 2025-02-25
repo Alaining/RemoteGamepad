@@ -7,7 +7,7 @@ import copy
 # Prompt the user for the UDP_IP address
 UDP_IP = input("Enter the receiver's IPv6 address (e.g., 2806:290:a80a:64cb:8fe5:b5e0:58dd:668a): ").strip()
 UDP_PORT = 5005
-DEADZONE = 0.1
+DEADZONE = 0.01
 PRINT_UPDATES = True
 
 # Validate the IPv6 address (basic check)
@@ -33,16 +33,21 @@ sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
 # Store last button states to detect changes
 last_buttons = {}
 
-# Declare data vars
+# Initialize the data dictionary with empty lists or dictionaries for buttons, axes, and dpad
 data = {
     "buttons": {},
-    "axes": {}
+    "axes": {},
+    "dpad": {}
 }
 
-prev_data = {
-    "buttons": {},
-    "axes": {}
-}
+
+prev_data = copy.deepcopy(data)
+
+# Function to apply deadzone to axis values
+def apply_deadzone(value, deadzone):
+    if abs(value) < deadzone:
+        return 0
+    return value
 
 # Main loop
 try:
@@ -54,8 +59,18 @@ try:
             current_state = joystick.get_button(i)
             data["buttons"][f"button_{i}"] = current_state
 
+        # Detect axis movements
+        for i in range(joystick.get_numaxes()):
+            current_state = round(joystick.get_axis(i),1)
+            data["axes"][f"axis_{i}"] = current_state
+
+        # Detect hat (d-pad) movements
+        for i in range(joystick.get_numhats()):
+            data["dpad"][f"dpad_{i}"] = joystick.get_hat(i)
+
         if data != prev_data:
-            print(json.dumps(data, indent=2))
+            if PRINT_UPDATES:
+                print(json.dumps(data, indent=2))
             prev_data = copy.deepcopy(data)
 
             # Send data over UDP

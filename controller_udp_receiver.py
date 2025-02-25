@@ -1,6 +1,7 @@
 import socket
 import json
 import pyvjoy
+import math
 
 # Configuration
 UDP_IP = "::"  # Listen on all available IPv6 interfaces
@@ -36,6 +37,23 @@ def set_vjoy_axes(axes):
         elif "axis_5" in axis:
             j.set_axis(pyvjoy.HID_USAGE_RZ, axis_value)
 
+def set_vjoy_hat(dpads):
+    # Set the POV hat based on d-pad (hat) input
+    if "dpad_0" in dpads:
+        x, y = dpads["dpad_0"]
+        
+        # Calculate the POV hat value (in hundredths of a degree)
+        if x == 0 and y == 0:
+            pov_value = -1  # Neutral position
+        else:
+            angle = math.degrees(math.atan2(y, x))
+            if angle < 0:
+                angle += 360
+            pov_value = int(angle * 100)  # vJoy expects POV in hundredths of a degree
+        
+        # Set the POV hat value
+        # j.set_axis(pyvjoy.HID_USAGE_POV, pov_value)
+
 try:
     while True:
         # Receive data
@@ -46,9 +64,10 @@ try:
             controller_data = json.loads(data.decode())
             print(json.dumps(controller_data, indent=2))
             
-            # Map buttons and axes to vJoy
+            # Map buttons, axes, and d-pad to vJoy
             set_vjoy_buttons(controller_data.get("buttons", {}))
             set_vjoy_axes(controller_data.get("axes", {}))
+            set_vjoy_hat(controller_data.get("dpad", {}))
         except json.JSONDecodeError:
             print("Received invalid JSON data")
 except KeyboardInterrupt:
