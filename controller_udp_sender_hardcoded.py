@@ -5,7 +5,7 @@ import time
 import copy
 
 # Prompt the user for the UDP_IP address
-UDP_IP = input("Enter the receiver's IPv6 address (e.g., 2806:290:a80a:64cb:8fe5:b5e0:58dd:668a): ").strip()
+UDP_IP = input("Enter the receiver's IP address (example 203.0.113.2): ").strip()
 UDP_PORT = 5005
 DEADZONE = 0.01
 PRINT_UPDATES = True

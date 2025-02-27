@@ -25,11 +25,11 @@ def set_vjoy_axes(axes):
     for axis, value in axes.items():
         axis_value = int((value + 1) * 16383)  # Normalize to vJoy range (0-32767)
         if "axis_0" in axis:
-            j.set_axis(pyvjoy.HID_USAGE_X, axis_value)
-        elif "axis_1" in axis:
-            j.set_axis(pyvjoy.HID_USAGE_Y, axis_value)
-        elif "axis_2" in axis:
             j.set_axis(pyvjoy.HID_USAGE_Z, axis_value)
+        elif "axis_1" in axis:
+            j.set_axis(pyvjoy.HID_USAGE_X, axis_value)
+        elif "axis_2" in axis:
+            j.set_axis(pyvjoy.HID_USAGE_Y, axis_value)
         elif "axis_3" in axis:
             j.set_axis(pyvjoy.HID_USAGE_RX, axis_value)
         elif "axis_4" in axis:
@@ -42,17 +42,22 @@ def set_vjoy_hat(dpads):
     if "dpad_0" in dpads:
         x, y = dpads["dpad_0"]
         
-        # Calculate the POV hat value (in hundredths of a degree)
+        # Handle the neutral position properly
         if x == 0 and y == 0:
-            pov_value = -1  # Neutral position
+            pov_value = -1  # Neutral position for vJoy
         else:
-            angle = math.degrees(math.atan2(y, x))
+            angle = math.degrees(math.atan2(x, y))  # Calculate angle in degrees
             if angle < 0:
-                angle += 360
-            pov_value = int(angle * 100)  # vJoy expects POV in hundredths of a degree
-        
+                angle += 360  # Ensure positive angle
+            
+            # Convert to vJoy expected format (hundredths of a degree)
+            pov_value = int(angle * 100)
+
         # Set the POV hat value
-        # j.set_axis(pyvjoy.HID_USAGE_POV, pov_value)
+        try:
+            j.set_cont_pov(1,pov_value)
+        except pyvjoy.exceptions.vJoyException as e:
+            print("Failed to set POV hat:", e)
 
 try:
     while True:

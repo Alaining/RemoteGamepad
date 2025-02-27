@@ -5,15 +5,19 @@ import time
 import copy
 
 # Prompt the user for the UDP_IP address
-UDP_IP = input("Enter the receiver's IPv6 address (e.g., 2806:290:a80a:64cb:8fe5:b5e0:58dd:668a): ").strip()
+UDP_IP = input("Enter the receiver's IP address (example 203.0.113.2): ").strip()
+if UDP_IP == "":
+    UDP_IP = "127.0.0.1"
 UDP_PORT = 5005
 DEADZONE = 0.01
 PRINT_UPDATES = True
 
 # Validate the IPv6 address (basic check)
-if not UDP_IP or ":" not in UDP_IP:
-    print("Invalid IPv6 address. Exiting...")
+if not UDP_IP or "." not in UDP_IP:
+    print("Invalid IP address. Exiting...")
     exit()
+else:
+    print(f"Connecting to IP {UDP_IP}")
 
 # Initialize Pygame and Joystick
 pygame.init()
@@ -28,7 +32,7 @@ joystick.init()
 print(f"Connected to: {joystick.get_name()}")
 
 # Create an IPv6 UDP socket
-sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 # Store last button states to detect changes
 last_buttons = {}
