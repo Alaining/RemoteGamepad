@@ -33,9 +33,9 @@ def set_vjoy_axes(axes):
         elif "axis_3" in axis:
             j.set_axis(pyvjoy.HID_USAGE_RX, axis_value)
         elif "axis_4" in axis:
-            j.set_axis(pyvjoy.HID_USAGE_RY, axis_value)
+            j.set_axis(pyvjoy.HID_USAGE_RY, (int(axis_value/2)+16383))
         elif "axis_5" in axis:
-            j.set_axis(pyvjoy.HID_USAGE_RZ, axis_value)
+            j.set_axis(pyvjoy.HID_USAGE_RZ, (int(axis_value/2)+16383))
 
 def set_vjoy_hat(dpads):
     # Set the POV hat based on d-pad (hat) input

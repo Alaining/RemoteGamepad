@@ -9,7 +9,7 @@ UDP_IP = input("Enter the receiver's IP address (example 203.0.113.2): ").strip(
 if UDP_IP == "":
     UDP_IP = "127.0.0.1"
 UDP_PORT = 5005
-DEADZONE = 0.01
+DEADZONE = 0.1
 PRINT_UPDATES = True
 
 # Validate the IPv6 address (basic check)
