@@ -52,7 +52,7 @@ def set_vjoy_hat(dpads):
             
             # Convert to vJoy expected format (hundredths of a degree)
             pov_value = int(angle * 100)
-
+                    
         # Set the POV hat value
         try:
             j.set_cont_pov(1,pov_value)

@@ -71,6 +71,20 @@ try:
         # Detect hat (d-pad) movements
         for i in range(joystick.get_numhats()):
             data["dpad"][f"dpad_{i}"] = joystick.get_hat(i)
+            
+        # Map dpat to button 13-16
+        for i in range(joystick.get_numhats()):
+            # Map dpat to buttons 13-16
+            num_elements = len(data["dpad"][f"dpad_{i}"])
+            for k in range(num_elements):
+                hat_value = data["dpad"][f"dpad_{i}"][k]
+                if (hat_value == 0):
+                    data["buttons"][f"button_{13+k*2}"] = "0"
+                    data["buttons"][f"button_{14+k*2}"] = "0"
+                elif (hat_value == -1):
+                    data["buttons"][f"button_{13+k*2}"] = "1"
+                elif (hat_value == 1):
+                    data["buttons"][f"button_{14+k*2}"] = "1"
 
         if data != prev_data:
             if PRINT_UPDATES:
