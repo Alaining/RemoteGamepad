@@ -1,6 +1,6 @@
 import tkinter as tk
 from tkinter import scrolledtext
-
+import threading  # <-- Added
 import pygame
 import socket
 import json
@@ -63,9 +63,12 @@ def start_remote_gamepad(user_input):
 
 
     prev_data = copy.deepcopy(data)
+    
+    running = True
 
     # Main loop
     try:
+        first_run = True
         while True:
             pygame.event.pump()
 
@@ -100,7 +103,9 @@ def start_remote_gamepad(user_input):
             if data != prev_data:
                 if PRINT_UPDATES:
                     print(json.dumps(data, indent=2))
-                    terminal_print(json.dumps(data, indent=2) + '\n')
+                    if first_run is False: # Skip the first run
+                        terminal_print(json.dumps(data, indent=2) + '\n')
+                    first_run = False
                 prev_data = copy.deepcopy(data)
 
                 # Send data over UDP
@@ -114,24 +119,21 @@ def start_remote_gamepad(user_input):
         pygame.quit()
 ############################################################################################################
 
-
-# Functions for button clicks
-def print_hello():
-    terminal.insert(tk.END, "Hello\n")
-
-def print_world():
-    terminal.insert(tk.END, " World!\n")
-
-def print_input():
+def connect_remote_gamepad():
     user_input = input_box.get()
-    if user_input != "" and user_input != placeholder_text:
-        terminal.insert(tk.END, user_input + '\n')
-    input_box.delete(0, tk.END)
-    set_placeholder(None)
-    start_remote_gamepad(user_input)
+    # if user_input != "" and user_input != placeholder_text:
+    #     terminal.insert(tk.END, user_input + '\n')
+    # input_box.delete(0, tk.END)
+    # set_placeholder(None)
+    # Start gamepad loop in a separate thread
+    threading.Thread(target=start_remote_gamepad, args=(user_input,), daemon=True).start()
+    window.focus()  # sets focus to the main window itself
+
+
 
 def terminal_print(text):
     terminal.insert(tk.END, text)
+    terminal.see(tk.END)  # Autoscroll to the latest text
     
 # Placeholder handling functions
 placeholder_text = "Enter IPv4 address here"
@@ -149,7 +151,7 @@ def clear_placeholder(event):
 # Create window
 window = tk.Tk()
 window.title("Alain Cloud")
-window.geometry("400x320")
+window.geometry("400x700")
 
 # Input box with placeholder
 input_box = tk.Entry(window, width=40, fg='grey')
@@ -157,13 +159,14 @@ input_box.pack(pady=5)
 input_box.insert(0, placeholder_text)
 input_box.bind("<FocusIn>", clear_placeholder)
 input_box.bind("<FocusOut>", set_placeholder)
+input_box.bind("<Return>", lambda event: connect_remote_gamepad())
 
 # Button to print user input
-btn_input = tk.Button(window, text="Print Input", command=print_input)
+btn_input = tk.Button(window, text="Connect", command=connect_remote_gamepad)
 btn_input.pack(pady=5)
 
 # Terminal-like output
-terminal = scrolledtext.ScrolledText(window, width=40, height=10)
+terminal = scrolledtext.ScrolledText(window, width=40, height=36)
 terminal.pack(pady=10)
 
 # Start GUI event loop
