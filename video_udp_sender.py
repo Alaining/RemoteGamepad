@@ -7,7 +7,7 @@ import ctypes.wintypes
 
 TCP_PORT = 5007
 FRAMERATE = 30
-JPEG_QUALITY = 5   # 2=best, 31=worst
+JPEG_QUALITY = 31   # 2=best, 31=worst
 
 SOI = b'\xff\xd8'
 EOI = b'\xff\xd9'
@@ -122,7 +122,7 @@ try:
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE)
     buf = b""
     while True:
-        chunk = process.stdout.read(65536)
+        chunk = process.stdout.read1(65536)
         if not chunk:
             break
         buf += chunk
