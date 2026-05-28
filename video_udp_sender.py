@@ -4,6 +4,7 @@ import ctypes
 import ctypes.wintypes
 
 UDP_PORT = 5006
+FRAMERATE = 30
 
 
 def get_monitor_count():
@@ -81,15 +82,15 @@ target = pick_capture_target()
 
 if target[0] == "monitor":
     monitor_idx = target[1]
-    lavfi = f"ddagrab=output_idx={monitor_idx}:framerate=24,hwdownload,format=bgra"
+    lavfi = f"ddagrab=output_idx={monitor_idx}:framerate={FRAMERATE},hwdownload,format=bgra"
     label = f"Monitor {monitor_idx}"
 else:
     _, x, y, w, h = target
-    lavfi = f"ddagrab=output_idx=0:framerate=24:offset_x={x}:offset_y={y}:video_size={w}x{h},hwdownload,format=bgra"
+    lavfi = f"ddagrab=output_idx=0:framerate={FRAMERATE}:offset_x={x}:offset_y={y}:video_size={w}x{h},hwdownload,format=bgra"
     label = f"window ({w}x{h})"
 
-print(f"\nStreaming {label} to {ip}:{UDP_PORT} at 480p 24fps")
-print(f"Receive with: ffplay udp://0.0.0.0:{UDP_PORT} -fflags nobuffer -flags low_delay -framedrop -probesize 32 -analyzeduration 0 -sync ext\n")
+print(f"\nStreaming {label} to {ip}:{UDP_PORT} at 480p {FRAMERATE}fps")
+print(f"Receive with: ffplay udp://0.0.0.0:{UDP_PORT} -fflags nobuffer -flags low_delay -framedrop -probesize 32 -analyzeduration 0 -sync ext -max_delay 0\n")
 
 cmd = [
     "ffmpeg",
@@ -99,13 +100,16 @@ cmd = [
     "-c:v", "libx264",
     "-preset", "ultrafast",
     "-tune", "zerolatency",
-    "-g", "4",
-    "-b:v", "1000k",
-    "-maxrate", "1000k",
-    "-bufsize", "1000k",
+    "-g", "1",
+    "-b:v", "2000k",
+    "-maxrate", "2000k",
+    "-bufsize", "2000k",
+    "-benchmark",
+    "-muxdelay", "0",
+    "-muxpreload", "0",
     "-flush_packets", "1",
     "-f", "mpegts",
-    f"udp://{ip}:{UDP_PORT}",
+    f"udp://{ip}:{UDP_PORT}?pkt_size=4316",
 ]
 
 process = None
