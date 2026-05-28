@@ -1,10 +1,16 @@
 import subprocess
 import sys
+import socket
+import struct
 import ctypes
 import ctypes.wintypes
 
-UDP_PORT = 5006
+TCP_PORT = 5007
 FRAMERATE = 30
+JPEG_QUALITY = 5   # 2=best, 31=worst
+
+SOI = b'\xff\xd8'
+EOI = b'\xff\xd9'
 
 
 def get_monitor_count():
@@ -89,37 +95,59 @@ else:
     lavfi = f"ddagrab=output_idx=0:framerate={FRAMERATE}:offset_x={x}:offset_y={y}:video_size={w}x{h},hwdownload,format=bgra"
     label = f"window ({w}x{h})"
 
-print(f"\nStreaming {label} to {ip}:{UDP_PORT} at 480p {FRAMERATE}fps")
-print(f"Receive with: ffplay udp://0.0.0.0:{UDP_PORT} -fflags nobuffer -flags low_delay -framedrop -probesize 32 -analyzeduration 0 -sync ext -max_delay 0\n")
+print(f"\nStreaming {label} to {ip}:{TCP_PORT} at 480p {FRAMERATE}fps (MJPEG)")
+print("Make sure video_receiver.py is running on the receiver first.\n")
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+try:
+    sock.connect((ip, TCP_PORT))
+except ConnectionRefusedError:
+    print(f"Could not connect to {ip}:{TCP_PORT}. Start video_receiver.py on the receiver first.")
+    sys.exit(1)
 
 cmd = [
     "ffmpeg",
     "-f", "lavfi",
     "-i", lavfi,
-    "-vf", "scale=-2:480,format=yuv420p",
-    "-c:v", "libx264",
-    "-preset", "ultrafast",
-    "-tune", "zerolatency",
-    "-g", "1",
-    "-b:v", "2000k",
-    "-maxrate", "2000k",
-    "-bufsize", "2000k",
-    "-benchmark",
-    "-muxdelay", "0",
-    "-muxpreload", "0",
-    "-flush_packets", "1",
-    "-f", "mpegts",
-    f"udp://{ip}:{UDP_PORT}?pkt_size=4316",
+    "-vf", "scale=-2:480,format=yuvj420p",
+    "-c:v", "mjpeg",
+    "-q:v", str(JPEG_QUALITY),
+    "-f", "image2pipe",
+    "pipe:1",
 ]
 
 process = None
 try:
-    process = subprocess.Popen(cmd)
-    process.wait()
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    buf = b""
+    while True:
+        chunk = process.stdout.read(65536)
+        if not chunk:
+            break
+        buf += chunk
+
+        while True:
+            start = buf.find(SOI)
+            if start == -1:
+                buf = b""
+                break
+            end = buf.find(EOI, start + 2)
+            if end == -1:
+                if start > 0:
+                    buf = buf[start:]
+                break
+            frame = buf[start:end + 2]
+            buf = buf[end + 2:]
+            try:
+                sock.sendall(struct.pack(">I", len(frame)) + frame)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                print("\nReceiver disconnected.")
+                raise KeyboardInterrupt
+
 except KeyboardInterrupt:
     print("\nStopping stream...")
+finally:
     if process:
         process.terminate()
-except FileNotFoundError:
-    print("FFmpeg not found. Install FFmpeg and ensure it is on PATH.")
-    sys.exit(1)
+    sock.close()
