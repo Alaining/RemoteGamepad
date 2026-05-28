@@ -1,13 +1,13 @@
 import subprocess
 import sys
 import socket
-import struct
 import ctypes
 import ctypes.wintypes
 
-TCP_PORT = 5007
+UDP_PORT = 5006
 FRAMERATE = 30
-JPEG_QUALITY = 31   # 2=best, 31=worst
+JPEG_QUALITY = 31  # 2=best, 31=worst
+HEIGHT = 240       # Stream height (width scales to maintain aspect ratio)
 
 SOI = b'\xff\xd8'
 EOI = b'\xff\xd9'
@@ -95,22 +95,18 @@ else:
     lavfi = f"ddagrab=output_idx=0:framerate={FRAMERATE}:offset_x={x}:offset_y={y}:video_size={w}x{h},hwdownload,format=bgra"
     label = f"window ({w}x{h})"
 
-print(f"\nStreaming {label} to {ip}:{TCP_PORT} at 480p {FRAMERATE}fps (MJPEG)")
-print("Make sure video_receiver.py is running on the receiver first.\n")
+print(f"\nStreaming {label} to {ip}:{UDP_PORT} at {HEIGHT}p {FRAMERATE}fps (MJPEG)")
+print("Run video_receiver.py on the receiver to watch.\n")
 
-sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-try:
-    sock.connect((ip, TCP_PORT))
-except ConnectionRefusedError:
-    print(f"Could not connect to {ip}:{TCP_PORT}. Start video_receiver.py on the receiver first.")
-    sys.exit(1)
+# UDP socket — small send buffer to avoid frame queuing
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
 
 cmd = [
     "ffmpeg",
     "-f", "lavfi",
     "-i", lavfi,
-    "-vf", "scale=-2:480,format=yuvj420p",
+    "-vf", f"scale=-2:{HEIGHT},format=yuvj420p",
     "-c:v", "mjpeg",
     "-q:v", str(JPEG_QUALITY),
     "-f", "image2pipe",
@@ -127,6 +123,9 @@ try:
             break
         buf += chunk
 
+        # Extract all complete frames but only send the latest one —
+        # any older frames accumulated during a slow iteration are dropped.
+        latest_frame = None
         while True:
             start = buf.find(SOI)
             if start == -1:
@@ -137,13 +136,15 @@ try:
                 if start > 0:
                     buf = buf[start:]
                 break
-            frame = buf[start:end + 2]
+            latest_frame = buf[start:end + 2]
             buf = buf[end + 2:]
+
+        if latest_frame and len(latest_frame) <= 65507:
             try:
-                sock.sendall(struct.pack(">I", len(frame)) + frame)
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                print("\nReceiver disconnected.")
-                raise KeyboardInterrupt
+                sock.sendto(latest_frame, (ip, UDP_PORT))
+            except OSError as e:
+                print(f"\nSend error: {e}")
+                break
 
 except KeyboardInterrupt:
     print("\nStopping stream...")
