@@ -8,14 +8,19 @@ import ctypes.wintypes
 from collections import deque
 
 UDP_PORT = 5006
-ACK_PORT = 5007
-ACK_TIMEOUT = 0.15  # seconds to wait per stage ACK
-FRAMERATE = 30
-JPEG_QUALITY = 31  # 2=best, 31=worst
-HEIGHT = 480       # Stream height (width scales to maintain aspect ratio)
+ACK_PORT = 5007         # receiver sends latency ACKs back to this port
+ACK_TIMEOUT = 0.15      # seconds to wait per ACK stage before counting as lost
+FRAMERATE = 120
+JPEG_QUALITY = 31       # 2=best, 31=worst
+HEIGHT = 480            # stream height; width scales to maintain aspect ratio
 
+# JPEG frame delimiters used to extract frames from the ffmpeg byte stream
 SOI = b'\xff\xd8'
 EOI = b'\xff\xd9'
+
+# Frame packet layout: [seq: 4B big-endian uint][timestamp_ns: 8B big-endian int64][JPEG data]
+# ACK packet layout:   [seq: 4B][timestamp_ns: 8B][stage: 1B]  (receiver echoes header + stage)
+# ACK stages: 0=frame received, 1=decoded (imdecode done), 2=drawn (imshow+waitKey done)
 
 
 def get_monitor_count():
@@ -103,27 +108,31 @@ else:
 print(f"\nStreaming {label} to {ip}:{UDP_PORT} at {HEIGHT}p {FRAMERATE}fps (MJPEG)")
 print("Run video_receiver.py on the receiver to watch.\n")
 
-# UDP socket — small send buffer to avoid frame queuing
+# Small send buffer prevents the OS from queuing multiple frames ahead
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
 
+# Separate socket for receiving ACKs so the send socket stays unblocked
 ack_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 ack_sock.bind(("0.0.0.0", ACK_PORT))
 ack_sock.settimeout(ACK_TIMEOUT)
 
 seq = 0
-WINDOW = 60
-_enc = deque(maxlen=WINDOW)   # encode wait: prev send done → frame ready
-_snd = deque(maxlen=WINDOW)   # sendto() call duration
-_net = deque(maxlen=WINDOW)   # RTT to ACK stage 0 (frame received by receiver)
-_dec = deque(maxlen=WINDOW)   # ACK1 - ACK0 (imdecode)
-_drw = deque(maxlen=WINDOW)   # ACK2 - ACK1 (imshow + waitKey)
-_rtt   = deque(maxlen=WINDOW)   # RTT from sendto → ACK stage 2 (frame drawn)
-_total = deque(maxlen=WINDOW)   # frame ready in sender → drawn ACK received
+WINDOW = 60  # rolling average window (frames)
+
+# Latency sample buffers — all values in milliseconds
+_enc   = deque(maxlen=WINDOW)  # prev-send-done → frame ready: inter-frame interval (~1/fps)
+_snd   = deque(maxlen=WINDOW)  # sendto() syscall duration
+_net   = deque(maxlen=WINDOW)  # RTT to ACK stage 0 ÷ 2 = one-way network estimate
+_dec   = deque(maxlen=WINDOW)  # ACK1 − ACK0: imdecode time on receiver
+_drw   = deque(maxlen=WINDOW)  # ACK2 − ACK1: imshow+waitKey time on receiver
+_rtt   = deque(maxlen=WINDOW)  # sendto → ACK2: round-trip to frame drawn
+_total = deque(maxlen=WINDOW)  # prev-send-done → ACK2: includes encode wait, the viewer's true wait
+
 ack_miss = 0
 total_frames = 0
 fps_frames = 0
-t_prev_done = None
+t_prev_done = None  # timestamp of the most recent sendto() completion
 t_stats = time.perf_counter()
 t_fps_ref = time.perf_counter()
 
@@ -148,8 +157,8 @@ try:
             break
         buf += chunk
 
-        # Extract all complete frames but only send the latest one —
-        # any older frames accumulated during a slow iteration are dropped.
+        # Parse all complete JPEG frames from the buffer; keep only the latest
+        # to drop frames that piled up while we were waiting for ACKs.
         latest_frame = None
         t_frame_ready = None
         while True:
@@ -166,10 +175,13 @@ try:
             t_frame_ready = time.perf_counter_ns()
             buf = buf[end + 2:]
 
-        if latest_frame and len(latest_frame) <= 65495:  # 65507 - 12 byte header
+        if latest_frame and len(latest_frame) <= 65495:  # 65507 max UDP payload − 12B header
             try:
-                if t_prev_done is not None:
-                    _enc.append((t_frame_ready - t_prev_done) / 1e6)
+                # t_enc_start is when the previous frame finished sending — the moment
+                # ffmpeg started working on this frame from the viewer's perspective.
+                t_enc_start = t_prev_done
+                if t_enc_start is not None:
+                    _enc.append((t_frame_ready - t_enc_start) / 1e6)
 
                 header = struct.pack(">IQ", seq & 0xFFFFFFFF, t_frame_ready)
                 t0 = time.perf_counter_ns()
@@ -180,7 +192,8 @@ try:
                 total_frames += 1
                 fps_frames += 1
 
-                # Drain stale ACKs from any previous missed frames
+                # Drain any stale ACKs left over from a previously missed frame
+                # so we don't misattribute them to this frame's seq number.
                 ack_sock.setblocking(False)
                 while True:
                     try:
@@ -189,7 +202,8 @@ try:
                         break
                 ack_sock.settimeout(ACK_TIMEOUT)
 
-                # Collect up to 3 stage ACKs: 0=recv, 1=decoded, 2=drawn
+                # Collect up to 3 stage ACKs. Break early on timeout — if one
+                # stage is lost the remaining ones are likely lost too.
                 t_stages = {}
                 for _ in range(3):
                     try:
@@ -210,7 +224,8 @@ try:
                     _drw.append((t_stages[2] - t_stages[1]) / 1e6)
                 if 2 in t_stages:
                     _rtt.append((t_stages[2] - t0) / 1e6)
-                    _total.append((t_stages[2] - t_frame_ready) / 1e6)
+                    if t_enc_start is not None:
+                        _total.append((t_stages[2] - t_enc_start) / 1e6)
 
                 seq += 1
 
@@ -226,12 +241,10 @@ try:
                     net_est = f"{sum(_net)/len(_net)/2:.1f}" if _net else "---"
                     loss = f"{100*ack_miss/total_frames:.1f}" if total_frames else "0.0"
                     print(
-                        f"\rTotal:{a(_total)}ms  "
+                        f"Total:{a(_total)}ms  "
                         f"[Encode:{a(_enc)}ms  SendCall:{a(_snd)}ms  Net:{net_est}ms  "
                         f"Decode:{a(_dec)}ms  Draw:{a(_drw)}ms  RTT:{a(_rtt)}ms]  "
                         f"FPS:{fps:.1f}  Loss:{loss}%"
-                        "          ",
-                        end="", flush=True
                     )
 
             except OSError as e:

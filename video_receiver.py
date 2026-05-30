@@ -1,5 +1,4 @@
 import socket
-import struct
 import sys
 
 try:
@@ -10,7 +9,12 @@ except ImportError:
     sys.exit(1)
 
 UDP_PORT = 5006
-ACK_PORT = 5007
+ACK_PORT = 5007  # sender listens here for latency ACKs
+
+# Each received packet: [seq: 4B][timestamp_ns: 8B][JPEG data]
+# Each ACK sent back:   [seq: 4B][timestamp_ns: 8B][stage: 1B]
+# Stages: 0=received, 1=decoded, 2=drawn — sender uses these to measure per-stage latency.
+# All timestamps are the sender's; receiver never does time calculations.
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
@@ -24,23 +28,23 @@ try:
 
         if len(data) < 12:
             continue
-        header = data[:12]
+        header = data[:12]   # seq + timestamp, echoed back verbatim in every ACK
         jpeg = data[12:]
 
-        # Stage 0: frame received (before any processing)
+        # Stage 0: frame received, no processing yet
         sock.sendto(header + b'\x00', ack_addr)
 
         frame = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
 
-        # Stage 1: frame decoded
+        # Stage 1: decode complete
         sock.sendto(header + b'\x01', ack_addr)
 
         if frame is not None:
             cv2.imshow("RemoteGamepad", frame)
 
-        key = cv2.waitKey(1) & 0xFF
+        key = cv2.waitKey(1) & 0xFF  # pumps the OpenCV event loop, actually renders the frame
 
-        # Stage 2: frame drawn (waitKey triggers actual render)
+        # Stage 2: frame on screen
         sock.sendto(header + b'\x02', ack_addr)
 
         if key == ord('q'):
