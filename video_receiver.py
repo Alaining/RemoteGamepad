@@ -24,6 +24,18 @@ print(f"Listening on port {UDP_PORT}... (press Q in the video window to quit)")
 try:
     while True:
         data, addr = sock.recvfrom(65536)
+
+        # Drain any backlogged frames — discard all but the latest so we never
+        # fall behind. Frames skipped here will time out as ACK losses on the sender.
+        sock.setblocking(False)
+        try:
+            while True:
+                newer, newer_addr = sock.recvfrom(65536)
+                data, addr = newer, newer_addr
+        except (BlockingIOError, OSError):
+            pass
+        sock.setblocking(True)
+
         ack_addr = (addr[0], ACK_PORT)
 
         if len(data) < 12:
@@ -42,12 +54,12 @@ try:
         if frame is not None:
             cv2.imshow("RemoteGamepad", frame)
 
-        key = cv2.waitKey(1) & 0xFF  # pumps the OpenCV event loop, actually renders the frame
+        key = cv2.pollKey()  # pumps the OpenCV event loop without sleeping (avoids vsync lock)
 
         # Stage 2: frame on screen
         sock.sendto(header + b'\x02', ack_addr)
 
-        if key == ord('q'):
+        if key == ord('q') or key == ord('Q'):
             break
 
 except KeyboardInterrupt:
