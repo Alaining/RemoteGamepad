@@ -7,7 +7,7 @@ import ctypes.wintypes
 UDP_PORT = 5006
 FRAMERATE = 30
 JPEG_QUALITY = 31  # 2=best, 31=worst
-HEIGHT = 240       # Stream height (width scales to maintain aspect ratio)
+HEIGHT = 480       # Stream height (width scales to maintain aspect ratio)
 
 SOI = b'\xff\xd8'
 EOI = b'\xff\xd9'
