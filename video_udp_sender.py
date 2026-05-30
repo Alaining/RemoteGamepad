@@ -10,7 +10,7 @@ from collections import deque
 UDP_PORT = 5006
 ACK_PORT = 5007         # receiver sends latency ACKs back to this port
 ACK_TIMEOUT = 0.15      # seconds to wait per ACK stage before counting as lost
-FRAMERATE = 120         # capture and stream frame rate
+FRAMERATE = 160         # capture and stream frame rate
 JPEG_QUALITY = 31       # 2=best, 31=worst (ffmpeg -q:v scale)
 HEIGHT = 480            # stream height; width auto-scaled to maintain aspect ratio
 
