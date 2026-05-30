@@ -1,10 +1,15 @@
 import subprocess
 import sys
 import socket
+import struct
+import time
 import ctypes
 import ctypes.wintypes
+from collections import deque
 
 UDP_PORT = 5006
+ACK_PORT = 5007
+ACK_TIMEOUT = 0.15  # seconds to wait per stage ACK
 FRAMERATE = 30
 JPEG_QUALITY = 31  # 2=best, 31=worst
 HEIGHT = 480       # Stream height (width scales to maintain aspect ratio)
@@ -102,6 +107,26 @@ print("Run video_receiver.py on the receiver to watch.\n")
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
 
+ack_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+ack_sock.bind(("0.0.0.0", ACK_PORT))
+ack_sock.settimeout(ACK_TIMEOUT)
+
+seq = 0
+WINDOW = 60
+_enc = deque(maxlen=WINDOW)   # encode wait: prev send done → frame ready
+_snd = deque(maxlen=WINDOW)   # sendto() call duration
+_net = deque(maxlen=WINDOW)   # RTT to ACK stage 0 (frame received by receiver)
+_dec = deque(maxlen=WINDOW)   # ACK1 - ACK0 (imdecode)
+_drw = deque(maxlen=WINDOW)   # ACK2 - ACK1 (imshow + waitKey)
+_rtt   = deque(maxlen=WINDOW)   # RTT from sendto → ACK stage 2 (frame drawn)
+_total = deque(maxlen=WINDOW)   # frame ready in sender → drawn ACK received
+ack_miss = 0
+total_frames = 0
+fps_frames = 0
+t_prev_done = None
+t_stats = time.perf_counter()
+t_fps_ref = time.perf_counter()
+
 cmd = [
     "ffmpeg",
     "-f", "lavfi",
@@ -126,6 +151,7 @@ try:
         # Extract all complete frames but only send the latest one —
         # any older frames accumulated during a slow iteration are dropped.
         latest_frame = None
+        t_frame_ready = None
         while True:
             start = buf.find(SOI)
             if start == -1:
@@ -137,11 +163,77 @@ try:
                     buf = buf[start:]
                 break
             latest_frame = buf[start:end + 2]
+            t_frame_ready = time.perf_counter_ns()
             buf = buf[end + 2:]
 
-        if latest_frame and len(latest_frame) <= 65507:
+        if latest_frame and len(latest_frame) <= 65495:  # 65507 - 12 byte header
             try:
-                sock.sendto(latest_frame, (ip, UDP_PORT))
+                if t_prev_done is not None:
+                    _enc.append((t_frame_ready - t_prev_done) / 1e6)
+
+                header = struct.pack(">IQ", seq & 0xFFFFFFFF, t_frame_ready)
+                t0 = time.perf_counter_ns()
+                sock.sendto(header + latest_frame, (ip, UDP_PORT))
+                t1 = time.perf_counter_ns()
+                _snd.append((t1 - t0) / 1e6)
+                t_prev_done = t1
+                total_frames += 1
+                fps_frames += 1
+
+                # Drain stale ACKs from any previous missed frames
+                ack_sock.setblocking(False)
+                while True:
+                    try:
+                        ack_sock.recvfrom(13)
+                    except Exception:
+                        break
+                ack_sock.settimeout(ACK_TIMEOUT)
+
+                # Collect up to 3 stage ACKs: 0=recv, 1=decoded, 2=drawn
+                t_stages = {}
+                for _ in range(3):
+                    try:
+                        data, _ = ack_sock.recvfrom(13)
+                        if len(data) == 13:
+                            ack_seq, _, stage = struct.unpack(">IQB", data)
+                            if ack_seq == (seq & 0xFFFFFFFF):
+                                t_stages[stage] = time.perf_counter_ns()
+                    except socket.timeout:
+                        ack_miss += 1
+                        break
+
+                if 0 in t_stages:
+                    _net.append((t_stages[0] - t0) / 1e6)
+                if 0 in t_stages and 1 in t_stages:
+                    _dec.append((t_stages[1] - t_stages[0]) / 1e6)
+                if 1 in t_stages and 2 in t_stages:
+                    _drw.append((t_stages[2] - t_stages[1]) / 1e6)
+                if 2 in t_stages:
+                    _rtt.append((t_stages[2] - t0) / 1e6)
+                    _total.append((t_stages[2] - t_frame_ready) / 1e6)
+
+                seq += 1
+
+                now = time.perf_counter()
+                if now - t_stats >= 1.0:
+                    fps = fps_frames / (now - t_fps_ref)
+                    fps_frames = 0
+                    t_fps_ref = now
+                    t_stats = now
+
+                    def a(d):
+                        return f"{sum(d)/len(d):.1f}" if d else "---"
+                    net_est = f"{sum(_net)/len(_net)/2:.1f}" if _net else "---"
+                    loss = f"{100*ack_miss/total_frames:.1f}" if total_frames else "0.0"
+                    print(
+                        f"\rTotal:{a(_total)}ms  "
+                        f"[Encode:{a(_enc)}ms  SendCall:{a(_snd)}ms  Net:{net_est}ms  "
+                        f"Decode:{a(_dec)}ms  Draw:{a(_drw)}ms  RTT:{a(_rtt)}ms]  "
+                        f"FPS:{fps:.1f}  Loss:{loss}%"
+                        "          ",
+                        end="", flush=True
+                    )
+
             except OSError as e:
                 print(f"\nSend error: {e}")
                 break
@@ -152,3 +244,4 @@ finally:
     if process:
         process.terminate()
     sock.close()
+    ack_sock.close()
