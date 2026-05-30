@@ -11,7 +11,7 @@ UDP_PORT = 5006
 ACK_PORT = 5007         # receiver sends latency ACKs back to this port
 ACK_TIMEOUT = 0.15      # seconds to wait per ACK stage before counting as lost
 FRAMERATE = 160         # capture and stream frame rate
-JPEG_QUALITY = 31       # 2=best, 31=worst (ffmpeg -q:v scale)
+JPEG_QUALITY = 20       # 2=best, 31=worst (ffmpeg -q:v scale)
 HEIGHT = 480            # stream height; width auto-scaled to maintain aspect ratio
 
 # JPEG frame delimiters used to extract frames from the ffmpeg byte stream
