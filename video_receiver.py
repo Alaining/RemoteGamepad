@@ -25,16 +25,22 @@ sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
 sock.bind(("0.0.0.0", UDP_PORT))
 print(f"Listening on port {UDP_PORT}... (press Q in the video window to quit)")
 
-_canvas = np.zeros((DISPLAY_HEIGHT, DISPLAY_WIDTH, 3), dtype=np.uint8)
+_canvas      = None
+_canvas_size = (0, 0)
 
-def letterbox(frame):
+def letterbox(frame, win_w, win_h):
+    global _canvas, _canvas_size
     h, w = frame.shape[:2]
-    scale = min(DISPLAY_WIDTH / w, DISPLAY_HEIGHT / h)
+    scale = min(win_w / w, win_h / h)
     nw, nh = int(w * scale), int(h * scale)
     resized = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
-    _canvas[:] = 0  # clear black bars from previous frame
-    y = (DISPLAY_HEIGHT - nh) // 2
-    x = (DISPLAY_WIDTH  - nw) // 2
+    if _canvas_size != (win_w, win_h):
+        _canvas      = np.zeros((win_h, win_w, 3), dtype=np.uint8)
+        _canvas_size = (win_w, win_h)
+    else:
+        _canvas[:] = 0
+    y = (win_h - nh) // 2
+    x = (win_w  - nw) // 2
     _canvas[y:y+nh, x:x+nw] = resized
     return _canvas
 
@@ -77,7 +83,10 @@ try:
         sock.sendto(header + b'\x01', ack_addr)
 
         if frame is not None:
-            cv2.imshow("RemoteGamepad", letterbox(frame))
+            r = cv2.getWindowImageRect("RemoteGamepad")
+            win_w = r[2] if r[2] > 0 else DISPLAY_WIDTH
+            win_h = r[3] if r[3] > 0 else DISPLAY_HEIGHT
+            cv2.imshow("RemoteGamepad", letterbox(frame, win_w, win_h))
 
         key = cv2.pollKey()  # pumps the OpenCV event loop without sleeping (avoids vsync lock)
 
