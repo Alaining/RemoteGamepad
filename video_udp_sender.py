@@ -12,7 +12,7 @@ ACK_PORT = 5007         # receiver sends latency ACKs back to this port
 ACK_TIMEOUT = 0.15      # seconds to wait per ACK stage before counting as lost
 FRAMERATE = 120
 JPEG_QUALITY = 31       # 2=best, 31=worst
-HEIGHT = 480            # stream height; width scales to maintain aspect ratio
+HEIGHT = 720            # stream height; width scales to maintain aspect ratio
 
 # JPEG frame delimiters used to extract frames from the ffmpeg byte stream
 SOI = b'\xff\xd8'
@@ -52,6 +52,22 @@ def get_window_rect(hwnd):
     return x, y, w, h
 
 
+def get_window_visual_rect(hwnd):
+    """Physical pixel bounds of the visible window, excluding the DWM shadow frame."""
+    rect = ctypes.wintypes.RECT()
+    ctypes.windll.dwmapi.DwmGetWindowAttribute(
+        hwnd, 9,  # DWMWA_EXTENDED_FRAME_BOUNDS
+        ctypes.byref(rect), ctypes.sizeof(rect)
+    )
+    return rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top
+
+
+def set_topmost(hwnd, enable):
+    flags = 0x0002 | 0x0001 | 0x0010  # SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+    z_order = -1 if enable else -2    # HWND_TOPMOST / HWND_NOTOPMOST
+    ctypes.windll.user32.SetWindowPos(hwnd, z_order, 0, 0, 0, 0, flags)
+
+
 def pick_capture_target():
     monitor_count = get_monitor_count()
     windows = list_windows()
@@ -73,14 +89,19 @@ def pick_capture_target():
             return ("monitor", idx)
         hwnd, title = windows[idx - monitor_count]
         x, y, w, h = get_window_rect(hwnd)
-        if w <= 0 or h <= 0:
-            print("Window has no visible area, defaulting to monitor 0.")
-            return ("monitor", 0)
         print(f"Capturing '{title}' at {w}x{h} ({x},{y})")
-        return ("window", x, y, w, h)
+        return ("window", hwnd, title)
     except (ValueError, IndexError):
         print("Invalid selection, defaulting to monitor 0.")
         return ("monitor", 0)
+
+
+def build_window_lavfi(hwnd):
+    x, y, w, h = get_window_visual_rect(hwnd)
+    if w <= 0 or h <= 0:
+        return None, None
+    lavfi = f"ddagrab=output_idx=0:framerate={FRAMERATE}:offset_x={x}:offset_y={y}:video_size={w}x{h},hwdownload,format=bgra"
+    return lavfi, (x, y, w, h)
 
 
 if len(sys.argv) > 1:
@@ -98,12 +119,13 @@ target = pick_capture_target()
 
 if target[0] == "monitor":
     monitor_idx = target[1]
-    lavfi = f"ddagrab=output_idx={monitor_idx}:framerate={FRAMERATE},hwdownload,format=bgra"
+    base_lavfi = f"ddagrab=output_idx={monitor_idx}:framerate={FRAMERATE},hwdownload,format=bgra"
     label = f"Monitor {monitor_idx}"
+    hwnd = None
 else:
-    _, x, y, w, h = target
-    lavfi = f"ddagrab=output_idx=0:framerate={FRAMERATE}:offset_x={x}:offset_y={y}:video_size={w}x{h},hwdownload,format=bgra"
-    label = f"window ({w}x{h})"
+    _, hwnd, title = target
+    base_lavfi = None  # built fresh each time from current window rect
+    label = f"window '{title}'"
 
 print(f"\nStreaming {label} to {ip}:{UDP_PORT} at {HEIGHT}p {FRAMERATE}fps (MJPEG)")
 print("Run video_receiver.py on the receiver to watch.\n")
@@ -136,120 +158,155 @@ t_prev_done = None  # timestamp of the most recent sendto() completion
 t_stats = time.perf_counter()
 t_fps_ref = time.perf_counter()
 
-cmd = [
-    "ffmpeg",
-    "-f", "lavfi",
-    "-i", lavfi,
-    "-vf", f"scale=-2:{HEIGHT},format=yuvj420p",
-    "-c:v", "mjpeg",
-    "-q:v", str(JPEG_QUALITY),
-    "-f", "image2pipe",
-    "pipe:1",
-]
-
 process = None
 try:
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE)
-    buf = b""
-    while True:
-        chunk = process.stdout.read1(65536)
-        if not chunk:
-            break
-        buf += chunk
+    while True:  # outer loop: restarts ffmpeg after minimization
+        # For window capture, wait until the window is restored and get its current rect
+        if hwnd is not None:
+            while ctypes.windll.user32.IsIconic(hwnd):
+                time.sleep(0.05)
+            lavfi, current_rect = build_window_lavfi(hwnd)
+            if lavfi is None:
+                time.sleep(0.1)
+                continue  # window rect not usable yet, retry
+            set_topmost(hwnd, True)  # keep target window above others during capture
+            print("Starting stream...")
+        else:
+            lavfi = base_lavfi
 
-        # Parse all complete JPEG frames from the buffer; keep only the latest
-        # to drop frames that piled up while we were waiting for ACKs.
-        latest_frame = None
-        t_frame_ready = None
+        cmd = [
+            "ffmpeg",
+            "-f", "lavfi",
+            "-i", lavfi,
+            "-vf", f"scale=-2:{HEIGHT},format=yuvj420p",
+            "-c:v", "mjpeg",
+            "-q:v", str(JPEG_QUALITY),
+            "-f", "image2pipe",
+            "pipe:1",
+        ]
+
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        buf = b""
+        needs_restart = False
+
         while True:
-            start = buf.find(SOI)
-            if start == -1:
-                buf = b""
-                break
-            end = buf.find(EOI, start + 2)
-            if end == -1:
-                if start > 0:
-                    buf = buf[start:]
-                break
-            latest_frame = buf[start:end + 2]
-            t_frame_ready = time.perf_counter_ns()
-            buf = buf[end + 2:]
+            if hwnd is not None:
+                if ctypes.windll.user32.IsIconic(hwnd):
+                    print("\nWindow minimized, pausing stream...")
+                    needs_restart = True
+                    break
+                # Restart ffmpeg if the window moved or resized
+                if get_window_visual_rect(hwnd) != current_rect:
+                    needs_restart = True
+                    break
 
-        if latest_frame and len(latest_frame) <= 65495:  # 65507 max UDP payload − 12B header
-            try:
-                # t_enc_start is when the previous frame finished sending — the moment
-                # ffmpeg started working on this frame from the viewer's perspective.
-                t_enc_start = t_prev_done
-                if t_enc_start is not None:
-                    _enc.append((t_frame_ready - t_enc_start) / 1e6)
+            chunk = process.stdout.read1(65536)
+            if not chunk:
+                break  # ffmpeg exited
+            buf += chunk
 
-                header = struct.pack(">IQ", seq & 0xFFFFFFFF, t_frame_ready)
-                t0 = time.perf_counter_ns()
-                sock.sendto(header + latest_frame, (ip, UDP_PORT))
-                t1 = time.perf_counter_ns()
-                _snd.append((t1 - t0) / 1e6)
-                t_prev_done = t1
-                total_frames += 1
-                fps_frames += 1
+            # Parse all complete JPEG frames from the buffer; keep only the latest
+            # to drop frames that piled up while we were waiting for ACKs.
+            latest_frame = None
+            t_frame_ready = None
+            while True:
+                start = buf.find(SOI)
+                if start == -1:
+                    buf = b""
+                    break
+                end = buf.find(EOI, start + 2)
+                if end == -1:
+                    if start > 0:
+                        buf = buf[start:]
+                    break
+                latest_frame = buf[start:end + 2]
+                t_frame_ready = time.perf_counter_ns()
+                buf = buf[end + 2:]
 
-                # Drain any stale ACKs left over from a previously missed frame
-                # so we don't misattribute them to this frame's seq number.
-                ack_sock.setblocking(False)
-                while True:
-                    try:
-                        ack_sock.recvfrom(13)
-                    except Exception:
-                        break
-                ack_sock.settimeout(ACK_TIMEOUT)
-
-                # Collect up to 3 stage ACKs. Break early on timeout — if one
-                # stage is lost the remaining ones are likely lost too.
-                t_stages = {}
-                for _ in range(3):
-                    try:
-                        data, _ = ack_sock.recvfrom(13)
-                        if len(data) == 13:
-                            ack_seq, _, stage = struct.unpack(">IQB", data)
-                            if ack_seq == (seq & 0xFFFFFFFF):
-                                t_stages[stage] = time.perf_counter_ns()
-                    except socket.timeout:
-                        ack_miss += 1
-                        break
-
-                if 0 in t_stages:
-                    _net.append((t_stages[0] - t0) / 1e6)
-                if 0 in t_stages and 1 in t_stages:
-                    _dec.append((t_stages[1] - t_stages[0]) / 1e6)
-                if 1 in t_stages and 2 in t_stages:
-                    _drw.append((t_stages[2] - t_stages[1]) / 1e6)
-                if 2 in t_stages:
-                    _rtt.append((t_stages[2] - t0) / 1e6)
+            if latest_frame and len(latest_frame) <= 65495:  # 65507 max UDP payload − 12B header
+                try:
+                    # t_enc_start is when the previous frame finished sending — the moment
+                    # ffmpeg started working on this frame from the viewer's perspective.
+                    t_enc_start = t_prev_done
                     if t_enc_start is not None:
-                        _total.append((t_stages[2] - t_enc_start) / 1e6)
+                        _enc.append((t_frame_ready - t_enc_start) / 1e6)
 
-                seq += 1
+                    header = struct.pack(">IQ", seq & 0xFFFFFFFF, t_frame_ready)
+                    t0 = time.perf_counter_ns()
+                    sock.sendto(header + latest_frame, (ip, UDP_PORT))
+                    t1 = time.perf_counter_ns()
+                    _snd.append((t1 - t0) / 1e6)
+                    t_prev_done = t1
+                    total_frames += 1
+                    fps_frames += 1
 
-                now = time.perf_counter()
-                if now - t_stats >= 1.0:
-                    fps = fps_frames / (now - t_fps_ref)
-                    fps_frames = 0
-                    t_fps_ref = now
-                    t_stats = now
+                    # Drain any stale ACKs left over from a previously missed frame
+                    # so we don't misattribute them to this frame's seq number.
+                    ack_sock.setblocking(False)
+                    while True:
+                        try:
+                            ack_sock.recvfrom(13)
+                        except Exception:
+                            break
+                    ack_sock.settimeout(ACK_TIMEOUT)
 
-                    def a(d):
-                        return f"{sum(d)/len(d):.1f}" if d else "---"
-                    net_est = f"{sum(_net)/len(_net)/2:.1f}" if _net else "---"
-                    loss = f"{100*ack_miss/total_frames:.1f}" if total_frames else "0.0"
-                    print(
-                        f"Total:{a(_total)}ms  "
-                        f"[Encode:{a(_enc)}ms  SendCall:{a(_snd)}ms  Net:{net_est}ms  "
-                        f"Decode:{a(_dec)}ms  Draw:{a(_drw)}ms  RTT:{a(_rtt)}ms]  "
-                        f"FPS:{fps:.1f}  Loss:{loss}%"
-                    )
+                    # Collect up to 3 stage ACKs. Break early on timeout — if one
+                    # stage is lost the remaining ones are likely lost too.
+                    t_stages = {}
+                    for _ in range(3):
+                        try:
+                            data, _ = ack_sock.recvfrom(13)
+                            if len(data) == 13:
+                                ack_seq, _, stage = struct.unpack(">IQB", data)
+                                if ack_seq == (seq & 0xFFFFFFFF):
+                                    t_stages[stage] = time.perf_counter_ns()
+                        except socket.timeout:
+                            ack_miss += 1
+                            break
 
-            except OSError as e:
-                print(f"\nSend error: {e}")
-                break
+                    if 0 in t_stages:
+                        _net.append((t_stages[0] - t0) / 1e6)
+                    if 0 in t_stages and 1 in t_stages:
+                        _dec.append((t_stages[1] - t_stages[0]) / 1e6)
+                    if 1 in t_stages and 2 in t_stages:
+                        _drw.append((t_stages[2] - t_stages[1]) / 1e6)
+                    if 2 in t_stages:
+                        _rtt.append((t_stages[2] - t0) / 1e6)
+                        if t_enc_start is not None:
+                            _total.append((t_stages[2] - t_enc_start) / 1e6)
+
+                    seq += 1
+
+                    now = time.perf_counter()
+                    if now - t_stats >= 1.0:
+                        fps = fps_frames / (now - t_fps_ref)
+                        fps_frames = 0
+                        t_fps_ref = now
+                        t_stats = now
+
+                        def a(d):
+                            return f"{sum(d)/len(d):.1f}" if d else "---"
+                        net_est = f"{sum(_net)/len(_net)/2:.1f}" if _net else "---"
+                        loss = f"{100*ack_miss/total_frames:.1f}" if total_frames else "0.0"
+                        print(
+                            f"Total:{a(_total)}ms  "
+                            f"[Encode:{a(_enc)}ms  SendCall:{a(_snd)}ms  Net:{net_est}ms  "
+                            f"Decode:{a(_dec)}ms  Draw:{a(_drw)}ms  RTT:{a(_rtt)}ms]  "
+                            f"FPS:{fps:.1f}  Loss:{loss}%"
+                        )
+
+                except OSError as e:
+                    print(f"\nSend error: {e}")
+                    break
+
+        process.terminate()
+        process.wait()
+        process = None
+
+        if hwnd is not None:
+            set_topmost(hwnd, False)  # restore normal Z-order
+        if not needs_restart:
+            break  # ffmpeg exited for a non-minimization reason, stop
 
 except KeyboardInterrupt:
     print("\nStopping stream...")
