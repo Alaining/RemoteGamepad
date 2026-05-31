@@ -197,8 +197,7 @@ t_stats = time.perf_counter()
 t_fps_ref = time.perf_counter()
 
 receiver_ready = True
-consecutive_miss = 0       # frames with zero ACKs in a row; resets on any ACK or heartbeat
-last_receiver_contact = time.perf_counter()
+consecutive_miss = 0  # frames with zero ACKs in a row; resets on any ACK
 last_probe_time = 0.0
 
 process = None
@@ -332,12 +331,11 @@ try:
                     total_frames += 1
                     fps_frames += 1
 
-                    # Drain stale ACKs; any packet updates last_receiver_contact
+                    # Drain stale ACKs from any previously missed frame
                     ack_sock.setblocking(False)
                     while True:
                         try:
-                            ack_sock.recvfrom(64)
-                            last_receiver_contact = time.perf_counter()
+                            ack_sock.recvfrom(13)
                         except Exception:
                             break
                     ack_sock.settimeout(ACK_TIMEOUT)
@@ -346,8 +344,7 @@ try:
                     t_stages = {}
                     for _ in range(3):
                         try:
-                            data, _ = ack_sock.recvfrom(64)
-                            last_receiver_contact = time.perf_counter()
+                            data, _ = ack_sock.recvfrom(13)
                             if len(data) == 13:
                                 ack_seq, _, stage = struct.unpack(">IQB", data)
                                 if ack_seq == (seq & 0xFFFFFFFF):
