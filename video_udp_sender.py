@@ -235,7 +235,6 @@ try:
             "-vf", f"scale=-2:{HEIGHT},format=yuvj420p",
             "-c:v", "mjpeg",
             "-q:v", str(JPEG_QUALITY),
-            "-flush_packets", "1",
             "-f", "image2pipe",
             "pipe:1",
         ]
