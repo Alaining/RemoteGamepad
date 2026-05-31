@@ -11,6 +11,8 @@ from collections import deque
 UDP_PORT = 5006
 ACK_PORT = 5007         # receiver sends latency ACKs back to this port
 ACK_TIMEOUT = 0.15      # seconds to wait per ACK stage before counting as lost
+RECEIVER_TIMEOUT = 3.0  # seconds without any packet from receiver before pausing
+PROBE_INTERVAL = 2.0    # seconds between probe frames sent while receiver is gone
 FRAMERATE = 160         # capture and stream frame rate
 JPEG_QUALITY = 20       # 2=best, 31=worst (ffmpeg -q:v scale)
 HEIGHT = 480            # stream height; width auto-scaled to maintain aspect ratio
@@ -84,18 +86,20 @@ def wait_for_window_stable(hwnd):
         prev = curr
 
 
-def drain_pipe(pipe):
+def drain_pipe(pipe_raw):
     """Read all currently buffered pipe data without blocking (Windows only).
-    Uses PeekNamedPipe to know exactly how many bytes are ready so read1()
-    never blocks, clearing the stale-frame backlog that builds up during ACK waits."""
+    Operates on the raw FileIO to bypass Python's BufferedReader, so PeekNamedPipe
+    accurately reflects all unread bytes and no frames hide in Python's IO buffer."""
     avail = ctypes.c_ulong(0)
-    handle = ctypes.c_void_p(msvcrt.get_osfhandle(pipe.fileno()))
+    handle = ctypes.c_void_p(msvcrt.get_osfhandle(pipe_raw.fileno()))
     data = b""
     while True:
         ctypes.windll.kernel32.PeekNamedPipe(handle, None, 0, None, ctypes.byref(avail), None)
         if avail.value == 0:
             break
-        data += pipe.read1(min(65536, avail.value))
+        chunk = pipe_raw.read(min(65536, avail.value))
+        if chunk:
+            data += chunk
     return data
 
 
@@ -194,6 +198,11 @@ t_prev_done = None  # set after ACK collection; Encode measures from here to nex
 t_stats = time.perf_counter()
 t_fps_ref = time.perf_counter()
 
+receiver_ready = True
+last_receiver_contact = time.perf_counter()  # time of last ACK or heartbeat from receiver
+last_probe_time = 0.0
+_last_wait_print = 0.0
+
 process = None
 needs_restart = False
 try:
@@ -226,11 +235,13 @@ try:
             "-vf", f"scale=-2:{HEIGHT},format=yuvj420p",
             "-c:v", "mjpeg",
             "-q:v", str(JPEG_QUALITY),
+            "-flush_packets", "1",
             "-f", "image2pipe",
             "pipe:1",
         ]
 
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        stdout_raw = process.stdout.raw  # bypass Python's BufferedReader entirely
         buf = b""
         needs_restart = False
         _hold_until_ns = time.perf_counter_ns() + 50_000_000  # 50ms blackout after ffmpeg starts
@@ -246,10 +257,10 @@ try:
                     needs_restart = True
                     break
 
-            chunk = process.stdout.read1(65536)  # blocks until first bytes arrive
+            chunk = stdout_raw.read(65536)  # one OS read, no Python IO buffering
             if not chunk:
                 break
-            buf += chunk + drain_pipe(process.stdout)  # drain any backlog without blocking
+            buf += chunk + drain_pipe(stdout_raw)  # drain any backlog without blocking
 
             # Extract all complete JPEG frames; keep only the latest —
             # frames that piled up during ACK wait are dropped.
@@ -277,6 +288,32 @@ try:
 
                 if _now_ns < _hold_until_ns:
                     continue  # inside blackout window (startup or focus regain)
+
+                if not receiver_ready:
+                    # Any packet on ack_sock (ACK or heartbeat) means receiver is back
+                    ack_sock.setblocking(False)
+                    try:
+                        ack_sock.recvfrom(64)
+                        last_receiver_contact = time.perf_counter()
+                        receiver_ready = True
+                        print("\nReceiver ready, resuming stream.")
+                    except (BlockingIOError, OSError):
+                        pass
+                    ack_sock.settimeout(ACK_TIMEOUT)
+                    _pnow = time.perf_counter()
+                    if _pnow - _last_wait_print >= 2.0:
+                        print("Waiting for receiver...", end='\r')
+                        _last_wait_print = _pnow
+                    # Send a probe frame every PROBE_INTERVAL (lets receiver respond on LAN)
+                    if _pnow - last_probe_time >= PROBE_INTERVAL:
+                        last_probe_time = _pnow
+                        _phdr = struct.pack(">IQ", seq & 0xFFFFFFFF, time.perf_counter_ns())
+                        try:
+                            sock.sendto(_phdr + latest_frame, (ip, UDP_PORT))
+                        except OSError:
+                            pass
+                    continue
+
                 try:
                     t_enc_start = t_prev_done
                     if t_enc_start is not None:
@@ -290,11 +327,12 @@ try:
                     total_frames += 1
                     fps_frames += 1
 
-                    # Drain stale ACKs from any previously missed frame
+                    # Drain stale ACKs; any packet updates last_receiver_contact
                     ack_sock.setblocking(False)
                     while True:
                         try:
-                            ack_sock.recvfrom(13)
+                            ack_sock.recvfrom(64)
+                            last_receiver_contact = time.perf_counter()
                         except Exception:
                             break
                     ack_sock.settimeout(ACK_TIMEOUT)
@@ -303,7 +341,8 @@ try:
                     t_stages = {}
                     for _ in range(3):
                         try:
-                            data, _ = ack_sock.recvfrom(13)
+                            data, _ = ack_sock.recvfrom(64)
+                            last_receiver_contact = time.perf_counter()
                             if len(data) == 13:
                                 ack_seq, _, stage = struct.unpack(">IQB", data)
                                 if ack_seq == (seq & 0xFFFFFFFF):
@@ -322,6 +361,11 @@ try:
                         _rtt.append((t_stages[2] - t0) / 1e6)
                         if t_enc_start is not None:
                             _total.append((t_stages[2] - t_enc_start) / 1e6)
+
+                    if time.perf_counter() - last_receiver_contact > RECEIVER_TIMEOUT:
+                        if receiver_ready:
+                            print("\nReceiver not responding, pausing stream...")
+                        receiver_ready = False
 
                     # t_prev_done after ACKs so Encode measures only pipe-delivery wait
                     t_prev_done = time.perf_counter_ns()

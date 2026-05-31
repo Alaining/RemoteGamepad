@@ -12,6 +12,7 @@ except ImportError:
 
 UDP_PORT = 5006
 ACK_PORT = 5007  # sender listens here for latency ACKs
+HEARTBEAT_INTERVAL = 2.0  # seconds between heartbeats sent to sender when no frames arrive
 
 DISPLAY_WIDTH  = 1280
 DISPLAY_HEIGHT = 720
@@ -76,6 +77,10 @@ frames_shown   = 0
 frames_dropped = 0
 t_stats = time.perf_counter()
 
+known_ack_addr = None   # sender's (ip, ACK_PORT), learned from first received frame
+last_frame_time = time.perf_counter()
+last_heartbeat_time = 0.0
+
 # Drain any packets buffered by the OS while the receiver was not running,
 # including frames that arrived during the window/cursor setup above.
 sock.setblocking(False)
@@ -91,7 +96,12 @@ try:
         try:
             data, addr = sock.recvfrom(65536)
         except socket.timeout:
-            # No frame arrived — check if the window was closed
+            # No frame arrived — send heartbeat to sender so it knows we're alive
+            if known_ack_addr is not None:
+                _now = time.perf_counter()
+                if _now - max(last_frame_time, last_heartbeat_time) >= HEARTBEAT_INTERVAL:
+                    sock.sendto(b'HELO', known_ack_addr)
+                    last_heartbeat_time = _now
             cv2.pollKey()
             if window_closed():
                 break
@@ -110,6 +120,8 @@ try:
         sock.settimeout(0.1)  # restore timeout (not setblocking(True) which would clear it)
 
         ack_addr = (addr[0], ACK_PORT)
+        known_ack_addr = ack_addr
+        last_frame_time = time.perf_counter()
 
         if len(data) < 12:
             continue
