@@ -86,20 +86,18 @@ def wait_for_window_stable(hwnd):
         prev = curr
 
 
-def drain_pipe(pipe_raw):
+def drain_pipe(pipe):
     """Read all currently buffered pipe data without blocking (Windows only).
-    Operates on the raw FileIO to bypass Python's BufferedReader, so PeekNamedPipe
-    accurately reflects all unread bytes and no frames hide in Python's IO buffer."""
+    Uses PeekNamedPipe to know exactly how many bytes are ready so read1()
+    never blocks, clearing the stale-frame backlog that builds up during ACK waits."""
     avail = ctypes.c_ulong(0)
-    handle = ctypes.c_void_p(msvcrt.get_osfhandle(pipe_raw.fileno()))
+    handle = ctypes.c_void_p(msvcrt.get_osfhandle(pipe.fileno()))
     data = b""
     while True:
         ctypes.windll.kernel32.PeekNamedPipe(handle, None, 0, None, ctypes.byref(avail), None)
         if avail.value == 0:
             break
-        chunk = pipe_raw.read(min(65536, avail.value))
-        if chunk:
-            data += chunk
+        data += pipe.read1(min(65536, avail.value))
     return data
 
 
@@ -240,7 +238,6 @@ try:
         ]
 
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        stdout_raw = process.stdout.raw  # bypass Python's BufferedReader entirely
         buf = b""
         needs_restart = False
         _hold_until_ns = time.perf_counter_ns() + 50_000_000  # 50ms blackout after ffmpeg starts
@@ -256,10 +253,10 @@ try:
                     needs_restart = True
                     break
 
-            chunk = stdout_raw.read(65536)  # one OS read, no Python IO buffering
+            chunk = process.stdout.read1(65536)  # blocks until first bytes arrive
             if not chunk:
                 break
-            buf += chunk + drain_pipe(stdout_raw)  # drain any backlog without blocking
+            buf += chunk + drain_pipe(process.stdout)  # drain any backlog without blocking
 
             # Extract all complete JPEG frames; keep only the latest —
             # frames that piled up during ACK wait are dropped.
