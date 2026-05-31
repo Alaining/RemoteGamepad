@@ -1,35 +1,47 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 1 — Imports
+# ─────────────────────────────────────────────────────────────────────────────
 import socket
 import sys
 import time
-import ctypes
+import ctypes  # Win32 APIs: find/fix the OpenCV window cursor
 
 try:
-    import cv2
-    import numpy as np
+    import cv2       # decode JPEG frames and display them in a window
+    import numpy as np  # wrap raw bytes into an array that cv2.imdecode can read
 except ImportError:
     print("Missing dependencies. Run: pip install opencv-python")
     sys.exit(1)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 2 — Constants
+# ─────────────────────────────────────────────────────────────────────────────
 UDP_PORT = 5006
-ACK_PORT = 5007  # sender listens here for latency ACKs
-HEARTBEAT_INTERVAL = 2.0  # seconds between heartbeats sent to sender when no frames arrive
+ACK_PORT = 5007              # sender listens here for latency ACKs
+HEARTBEAT_INTERVAL = 2.0     # seconds between heartbeats sent to sender when no frames arrive
 
-DISPLAY_WIDTH  = 1280
-DISPLAY_HEIGHT = 720
+DISPLAY_WIDTH  = 1280        # initial window width  (user can resize freely)
+DISPLAY_HEIGHT = 720         # initial window height
 
 # Each received packet: [seq: 4B][timestamp_ns: 8B][JPEG data]
 # Each ACK sent back:   [seq: 4B][timestamp_ns: 8B][stage: 1B]
 # Stages: 0=received, 1=decoded, 2=drawn — sender uses these to measure per-stage latency.
 # All timestamps are the sender's; receiver never does time calculations.
 
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 3 — Socket setup
+# ─────────────────────────────────────────────────────────────────────────────
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)  # small receive buffer: OS drops old packets when full, preventing queuing
 sock.bind(("0.0.0.0", UDP_PORT))
-sock.settimeout(0.1)  # allows Ctrl+C and window-close checks even when no frames arrive
+sock.settimeout(0.1)  # short timeout so Ctrl+C and window-close checks run even when no frames arrive
 print(f"Listening on port {UDP_PORT}... (press Q in the video window to quit)")
 
-_canvas      = None
-_canvas_size = (0, 0)
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 4 — Letterbox helper: fit frame inside display window with black bars
+# ─────────────────────────────────────────────────────────────────────────────
+_canvas      = None       # reused black backing canvas (avoids reallocating every frame)
+_canvas_size = (0, 0)     # tracks current canvas dimensions so we only reallocate on resize
 
 def letterbox(frame, win_w, win_h):
     global _canvas, _canvas_size
@@ -50,12 +62,17 @@ def letterbox(frame, win_w, win_h):
 def window_closed():
     return cv2.getWindowProperty("RemoteGamepad", cv2.WND_PROP_VISIBLE) < 1
 
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 5 — Create the display window
+# ─────────────────────────────────────────────────────────────────────────────
 cv2.namedWindow("RemoteGamepad", cv2.WINDOW_NORMAL)
 cv2.resizeWindow("RemoteGamepad", DISPLAY_WIDTH, DISPLAY_HEIGHT)
 
-# Fix cursor: OpenCV registers its window class with a crosshair cursor.
-# We change GCLP_HCURSOR on the top-level window AND all child windows
-# (the image area is a child HWND with its own class cursor).
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 6 — Fix cursor: OpenCV registers its window class with a crosshair.
+#   We replace it with the standard arrow on the top-level HWND and all child
+#   HWNDs (the image canvas is a separate child window with its own class cursor).
+# ─────────────────────────────────────────────────────────────────────────────
 _arrow = ctypes.windll.user32.LoadCursorW(None, 32512)  # IDC_ARROW
 _hwnd = 0
 for _ in range(10):                                      # wait up to 100ms for window to exist
@@ -72,17 +89,22 @@ if _hwnd:
         return True
     ctypes.windll.user32.EnumChildWindows(_hwnd, _fix_child, 0)
 
-
-frames_shown   = 0
-frames_dropped = 0
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 7 — Stats and heartbeat state
+# ─────────────────────────────────────────────────────────────────────────────
+frames_shown   = 0   # frames displayed this stats window
+frames_dropped = 0   # packets discarded by the drain loop this stats window
 t_stats = time.perf_counter()
 
-known_ack_addr = None   # sender's (ip, ACK_PORT), learned from first received frame
-last_frame_time = time.perf_counter()
-last_heartbeat_time = 0.0
+known_ack_addr    = None  # sender's (ip, ACK_PORT), learned from the first received frame
+last_frame_time   = time.perf_counter()  # time of the last successfully received frame
+last_heartbeat_time = 0.0  # time of the last HELO sent to the sender
 
-# Drain any packets buffered by the OS while the receiver was not running,
-# including frames that arrived during the window/cursor setup above.
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 8 — Startup drain: discard packets that arrived before we were ready
+#   Frames may have accumulated in the OS socket buffer during the window/cursor
+#   setup above. Drain them so we start fresh with the latest frame.
+# ─────────────────────────────────────────────────────────────────────────────
 sock.setblocking(False)
 while True:
     try:
@@ -91,35 +113,43 @@ while True:
         break
 sock.settimeout(0.1)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 9 — Main receive loop
+# ─────────────────────────────────────────────────────────────────────────────
 try:
     while True:
         try:
-            data, addr = sock.recvfrom(65536)
+            data, addr = sock.recvfrom(65536)  # blocks up to 0.1s waiting for the next frame
         except socket.timeout:
-            # No frame arrived — send heartbeat to sender so it knows we're alive
+            # No frame arrived — send a heartbeat to the sender so it knows we're alive.
+            # Only sent if no frame (or heartbeat) has been exchanged for HEARTBEAT_INTERVAL seconds.
             if known_ack_addr is not None:
                 _now = time.perf_counter()
                 if _now - max(last_frame_time, last_heartbeat_time) >= HEARTBEAT_INTERVAL:
-                    sock.sendto(b'HELO', known_ack_addr)
+                    sock.sendto(b'HELO', known_ack_addr)  # 4-byte signal; sender recognises this as "receiver alive"
                     last_heartbeat_time = _now
             cv2.pollKey()
             if window_closed():
                 break
             continue
 
-        # Drain any backlogged frames — discard all but the latest so we never
-        # fall behind. Frames skipped here will time out as ACK losses on the sender.
+        # ─────────────────────────────────────────────────────────────────────
+        # STEP 10 — Drain backlogged frames: keep only the latest
+        #   If frames accumulated while we were decoding/displaying, discard all
+        #   but the newest so we never fall behind. Skipped packets time out as
+        #   ACK losses on the sender side — that's intentional.
+        # ─────────────────────────────────────────────────────────────────────
         sock.setblocking(False)
         try:
             while True:
                 newer, newer_addr = sock.recvfrom(65536)
-                data, addr = newer, newer_addr
+                data, addr = newer, newer_addr  # update to the newest packet
                 frames_dropped += 1
         except (BlockingIOError, OSError):
             pass
         sock.settimeout(0.1)  # restore timeout (not setblocking(True) which would clear it)
 
-        ack_addr = (addr[0], ACK_PORT)
+        ack_addr = (addr[0], ACK_PORT)  # where to send ACKs back to
         known_ack_addr = ack_addr
         last_frame_time = time.perf_counter()
 
@@ -128,12 +158,16 @@ try:
         header = data[:12]   # seq + timestamp, echoed back verbatim in every ACK
         jpeg = data[12:]
 
-        # Stage 0: frame received, no processing yet
+        # ─────────────────────────────────────────────────────────────────────
+        # STEP 11 — ACK stage 0: frame received (before any processing)
+        # ─────────────────────────────────────────────────────────────────────
         sock.sendto(header + b'\x00', ack_addr)
 
-        frame = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+        frame = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)  # decode JPEG bytes → BGR numpy array
 
-        # Stage 1: decode complete
+        # ─────────────────────────────────────────────────────────────────────
+        # STEP 12 — ACK stage 1: decode complete
+        # ─────────────────────────────────────────────────────────────────────
         sock.sendto(header + b'\x01', ack_addr)
 
         if frame is not None:
@@ -142,13 +176,18 @@ try:
             win_h = r[3] if r[3] > 0 else DISPLAY_HEIGHT
             cv2.imshow("RemoteGamepad", letterbox(frame, win_w, win_h))
 
-        key = cv2.pollKey()  # pumps the OpenCV event loop without sleeping (avoids vsync lock)
+        key = cv2.pollKey()  # pump the OpenCV event loop without sleeping (avoids vsync lock)
 
-        # Stage 2: frame on screen
+        # ─────────────────────────────────────────────────────────────────────
+        # STEP 13 — ACK stage 2: frame is on screen
+        # ─────────────────────────────────────────────────────────────────────
         sock.sendto(header + b'\x02', ack_addr)
 
         frames_shown += 1
 
+        # ─────────────────────────────────────────────────────────────────────
+        # STEP 14 — Print stats once per second
+        # ─────────────────────────────────────────────────────────────────────
         now = time.perf_counter()
         if now - t_stats >= 1.0:
             elapsed = now - t_stats
@@ -164,5 +203,6 @@ try:
 except KeyboardInterrupt:
     print("\nExiting...")
 finally:
+    # STEP 15 — Cleanup
     cv2.destroyAllWindows()
     sock.close()

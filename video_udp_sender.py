@@ -1,29 +1,42 @@
-import subprocess
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 1 — Imports
+# ─────────────────────────────────────────────────────────────────────────────
+import subprocess              # spawn ffmpeg as a child process and read its stdout pipe
 import sys
 import socket
-import struct
+import struct                  # pack/unpack the binary frame header (seq + timestamp_ns)
 import time
-import msvcrt
-import ctypes
+import msvcrt                  # Windows-only: convert a Python file object to a Win32 HANDLE
+import ctypes                  # call Win32 APIs (window enumeration, DWM bounds, PeekNamedPipe)
 import ctypes.wintypes
-from collections import deque
+from collections import deque  # fixed-length rolling buffer for latency statistics
 
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 2 — Tunable constants
+# ─────────────────────────────────────────────────────────────────────────────
 UDP_PORT = 5006
 ACK_PORT = 5007         # receiver sends latency ACKs back to this port
 ACK_TIMEOUT = 0.15      # seconds to wait per ACK stage before counting as lost
 FRAMERATE = 120         # capture and stream frame rate
-JPEG_QUALITY = 20       # 2=best, 31=worst (ffmpeg -q:v scale)
+JPEG_QUALITY = 20       # 2=best/largest, 31=worst/smallest (ffmpeg -q:v scale)
 HEIGHT = 480            # stream height; width auto-scaled to maintain aspect ratio
 
-# JPEG frame delimiters used to extract frames from the ffmpeg byte stream
-SOI = b'\xff\xd8'
-EOI = b'\xff\xd9'
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 3 — JPEG frame delimiters
+#   ffmpeg writes a raw concatenation of JPEG images to stdout.
+#   We scan for SOI/EOI to extract individual frames from the pipe buffer.
+# ─────────────────────────────────────────────────────────────────────────────
+SOI = b'\xff\xd8'  # start-of-image: every JPEG begins with these 2 bytes
+EOI = b'\xff\xd9'  # end-of-image:   every JPEG ends   with these 2 bytes
 
 # Frame packet layout: [seq: 4B big-endian uint][timestamp_ns: 8B big-endian int64][JPEG data]
 # ACK packet layout:   [seq: 4B][timestamp_ns: 8B][stage: 1B]  (receiver echoes header + stage)
 # ACK stages: 0=frame received, 1=decoded (imdecode done), 2=drawn (imshow+pollKey done)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 4 — Window / monitor enumeration helpers (called once at startup)
+# ─────────────────────────────────────────────────────────────────────────────
 def get_monitor_count():
     return ctypes.windll.user32.GetSystemMetrics(80)  # SM_CMONITORS
 
@@ -84,6 +97,14 @@ def wait_for_window_stable(hwnd):
         prev = curr
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 5 — drain_pipe: drop stale frames that piled up during ACK wait
+#   While we're blocked waiting for ACKs, ffmpeg keeps encoding and writing
+#   to the pipe. We don't want to display those old frames — only the latest.
+#   PeekNamedPipe tells us exactly how many bytes are ready so read1() never
+#   blocks. We loop until the pipe is empty, then the caller picks the last
+#   complete JPEG from the combined buffer.
+# ─────────────────────────────────────────────────────────────────────────────
 def drain_pipe(pipe):
     """Read all currently buffered pipe data without blocking (Windows only).
     Uses PeekNamedPipe to know exactly how many bytes are ready so read1()
@@ -99,6 +120,13 @@ def drain_pipe(pipe):
     return data
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 6 — build_window_lavfi: construct the ffmpeg filter graph for window capture
+#   ddagrab reads directly from the GPU framebuffer (DXGI Desktop Duplication),
+#   which captures hardware-accelerated content that gdigrab cannot see.
+#   offset_x/offset_y/video_size restrict the capture to the window's rectangle.
+#   hwdownload + format=bgra move the frame from GPU memory to CPU memory.
+# ─────────────────────────────────────────────────────────────────────────────
 def build_window_lavfi(hwnd):
     """Build a ddagrab lavfi string from the window's current visible bounds."""
     x, y, w, h = get_window_visual_rect(hwnd)
@@ -112,6 +140,9 @@ def build_window_lavfi(hwnd):
     return lavfi, (x, y, w, h)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 7 — pick_capture_target: ask the user what to stream
+# ─────────────────────────────────────────────────────────────────────────────
 def pick_capture_target():
     monitor_count = get_monitor_count()
     windows = list_windows()
@@ -140,6 +171,9 @@ def pick_capture_target():
         return ("monitor", 0)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 8 — Startup: get receiver IP and capture source from the user
+# ─────────────────────────────────────────────────────────────────────────────
 if len(sys.argv) > 1:
     ip = sys.argv[1].strip()
 else:
@@ -166,36 +200,45 @@ else:
 print(f"\nStreaming {label} to {ip}:{UDP_PORT} at {HEIGHT}p {FRAMERATE}fps (MJPEG q={JPEG_QUALITY})")
 print("Run video_receiver.py on the receiver to watch.\n")
 
-# Small send buffer prevents the OS from queuing multiple frames ahead
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 9 — Socket setup
+# ─────────────────────────────────────────────────────────────────────────────
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)  # small send buffer: prevents OS from queuing multiple frames ahead of us
 
-# Separate socket for receiving ACKs so the send socket stays unblocked
-ack_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+ack_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # separate socket so ACK reads never interfere with frame sends
 ack_sock.bind(("0.0.0.0", ACK_PORT))
 ack_sock.settimeout(ACK_TIMEOUT)
 
-seq = 0
-WINDOW = 60  # rolling average window (frames)
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 10 — Latency metric state
+# ─────────────────────────────────────────────────────────────────────────────
+seq = 0      # monotonically increasing frame counter; echoed in every ACK so we can match replies to the right frame
+WINDOW = 60  # number of recent frames kept in each rolling latency average
 
-# Latency sample buffers — all values in milliseconds
-_enc   = deque(maxlen=WINDOW)  # prev-done → frame ready: WGC/pipe delivery wait
-_snd   = deque(maxlen=WINDOW)  # sendto() syscall duration
-_net   = deque(maxlen=WINDOW)  # RTT to ACK stage 0 ÷ 2 = one-way network estimate
-_dec   = deque(maxlen=WINDOW)  # ACK1 − ACK0: imdecode time on receiver
-_drw   = deque(maxlen=WINDOW)  # ACK2 − ACK1: imshow+pollKey time on receiver
-_rtt   = deque(maxlen=WINDOW)  # sendto → ACK2: round-trip to frame drawn
-_total = deque(maxlen=WINDOW)  # prev-done → ACK2: viewer's true end-to-end wait
+_enc   = deque(maxlen=WINDOW)  # time from previous ACK-done to this frame ready in the pipe (encode + pipe wait)
+_snd   = deque(maxlen=WINDOW)  # duration of the sendto() syscall
+_net   = deque(maxlen=WINDOW)  # (stage-0 RTT) ÷ 2 ≈ one-way network latency
+_dec   = deque(maxlen=WINDOW)  # stage-1 minus stage-0: imdecode time on the receiver
+_drw   = deque(maxlen=WINDOW)  # stage-2 minus stage-1: imshow + pollKey time on the receiver
+_rtt   = deque(maxlen=WINDOW)  # sendto to stage-2: round-trip until the frame is on screen
+_total = deque(maxlen=WINDOW)  # previous ACK-done to stage-2: true end-to-end viewer latency
 
-ack_miss = 0
-total_frames = 0
-fps_frames = 0
-t_prev_done = None  # set after ACK collection; Encode measures from here to next frame
+ack_miss = 0      # cumulative ACK stage timeouts across all frames
+total_frames = 0  # cumulative frames sent (denominator for loss%)
+fps_frames = 0    # frames sent since the last stats print; reset every second
+t_prev_done = None  # timestamp after previous frame's ACK collection; next Encode is measured from here
 t_stats = time.perf_counter()
 t_fps_ref = time.perf_counter()
 
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 11 — Outer loop: (re)start ffmpeg
+#   For window capture, ffmpeg must restart whenever the window moves or resizes
+#   because the capture rectangle is baked into the lavfi string at launch time.
+#   For monitor capture, ffmpeg runs continuously until the script is stopped.
+# ─────────────────────────────────────────────────────────────────────────────
 process = None
-needs_restart = False
+needs_restart = False  # set True when window moves/resizes so outer loop relaunches ffmpeg
 try:
     while True:  # outer loop: restarts ffmpeg after window move/resize/minimize
         if hwnd is not None:
@@ -219,6 +262,14 @@ try:
             lavfi = base_lavfi
             current_rect = None
 
+        # ─────────────────────────────────────────────────────────────────────
+        # STEP 12 — Launch ffmpeg
+        #   Pipeline: ddagrab (GPU framebuffer) → hwdownload (GPU→CPU) →
+        #   scale + format=yuvj420p → MJPEG encode → image2pipe (stdout).
+        #   yuvj420p is the JPEG colour space (full range); plain yuv420p
+        #   causes washed-out colours. stderr goes to DEVNULL to keep the
+        #   terminal clean.
+        # ─────────────────────────────────────────────────────────────────────
         cmd = [
             "ffmpeg",
             "-f", "lavfi",
@@ -231,12 +282,17 @@ try:
         ]
 
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        buf = b""
+        buf = b""           # accumulates raw bytes from the pipe until a complete JPEG can be extracted
         needs_restart = False
-        _hold_until_ns = time.perf_counter_ns() + 50_000_000  # 50ms blackout after ffmpeg starts
+        _hold_until_ns = time.perf_counter_ns() + 50_000_000  # 50ms blackout: skip stale frame ddagrab outputs on startup
 
+        # ─────────────────────────────────────────────────────────────────────
+        # STEP 13 — Inner loop: one iteration = one frame sent
+        # ─────────────────────────────────────────────────────────────────────
         while True:
-            # Check window state before blocking on the pipe
+            # Guard: check window state before blocking on the pipe (window capture only).
+            # If the window moved or was minimized, set needs_restart and break so the
+            # outer loop can relaunch ffmpeg with the updated rectangle.
             if hwnd is not None:
                 if ctypes.windll.user32.IsIconic(hwnd):
                     print("\nWindow minimized, pausing stream...")
@@ -246,13 +302,14 @@ try:
                     needs_restart = True
                     break
 
-            chunk = process.stdout.read1(65536)  # blocks until first bytes arrive
+            chunk = process.stdout.read1(65536)  # blocks until ffmpeg writes at least one byte (~1/FRAMERATE s)
             if not chunk:
                 break
-            buf += chunk + drain_pipe(process.stdout)  # drain any backlog without blocking
+            buf += chunk + drain_pipe(process.stdout)  # drain_pipe appends everything else already in the OS pipe buffer without blocking
 
-            # Extract all complete JPEG frames; keep only the latest —
-            # frames that piled up during ACK wait are dropped.
+            # Scan buf for complete JPEG frames and keep only the last one.
+            # Any frames that accumulated while we were blocked on ACK collection
+            # are silently discarded — the viewer always sees the most recent screen state.
             latest_frame = None
             t_frame_ready = None
             while True:
@@ -269,7 +326,7 @@ try:
                 t_frame_ready = time.perf_counter_ns()
                 buf = buf[end + 2:]
 
-            if latest_frame and len(latest_frame) <= 65495:  # 65507 max UDP − 12B header
+            if latest_frame and len(latest_frame) <= 65495:  # 65507 max UDP payload − 12B header = 65495 usable bytes
                 _now_ns = time.perf_counter_ns()
                 if hwnd is not None and ctypes.windll.user32.GetForegroundWindow() != hwnd:
                     _hold_until_ns = _now_ns + 50_000_000  # extend 50ms blackout on every unfocused frame
@@ -280,8 +337,10 @@ try:
                 try:
                     t_enc_start = t_prev_done
                     if t_enc_start is not None:
-                        _enc.append((t_frame_ready - t_enc_start) / 1e6)
+                        _enc.append((t_frame_ready - t_enc_start) / 1e6)  # pipe wait since last ACK-done
 
+                    # Header carries seq + sender timestamp_ns. The receiver echoes both verbatim
+                    # in every ACK so we can compute per-stage latencies using only the sender's clock.
                     header = struct.pack(">IQ", seq & 0xFFFFFFFF, t_frame_ready)
                     t0 = time.perf_counter_ns()
                     sock.sendto(header + latest_frame, (ip, UDP_PORT))
@@ -290,7 +349,9 @@ try:
                     total_frames += 1
                     fps_frames += 1
 
-                    # Drain stale ACKs from any previously missed frame
+                    # Discard any ACKs left over from a previously timed-out frame.
+                    # Without this, an old ACK arriving just now could be mistaken for
+                    # a stage-0 ACK of the frame we just sent.
                     ack_sock.setblocking(False)
                     while True:
                         try:
@@ -299,7 +360,9 @@ try:
                             break
                     ack_sock.settimeout(ACK_TIMEOUT)
 
-                    # Collect up to 3 stage ACKs; break early on timeout
+                    # Collect up to 3 stage ACKs (0=received, 1=decoded, 2=drawn).
+                    # Break on first timeout — no point waiting for later stages if an earlier one missed.
+                    # ACKs are matched by seq so late arrivals from prior frames are ignored.
                     t_stages = {}
                     for _ in range(3):
                         try:
@@ -313,20 +376,22 @@ try:
                             break
 
                     if 0 in t_stages:
-                        _net.append((t_stages[0] - t0) / 1e6)
+                        _net.append((t_stages[0] - t0) / 1e6)           # stage-0 RTT ÷ 2 ≈ one-way network
                     if 0 in t_stages and 1 in t_stages:
-                        _dec.append((t_stages[1] - t_stages[0]) / 1e6)
+                        _dec.append((t_stages[1] - t_stages[0]) / 1e6)  # imdecode time on receiver
                     if 1 in t_stages and 2 in t_stages:
-                        _drw.append((t_stages[2] - t_stages[1]) / 1e6)
+                        _drw.append((t_stages[2] - t_stages[1]) / 1e6)  # imshow + pollKey time on receiver
                     if 2 in t_stages:
-                        _rtt.append((t_stages[2] - t0) / 1e6)
+                        _rtt.append((t_stages[2] - t0) / 1e6)           # sendto → frame on screen
                         if t_enc_start is not None:
-                            _total.append((t_stages[2] - t_enc_start) / 1e6)
+                            _total.append((t_stages[2] - t_enc_start) / 1e6)  # true end-to-end viewer latency
 
-                    # t_prev_done after ACKs so Encode measures only pipe-delivery wait
-                    t_prev_done = time.perf_counter_ns()
+                    t_prev_done = time.perf_counter_ns()  # mark end of this frame; next Encode is measured from here
                     seq += 1
 
+                    # ─────────────────────────────────────────────────────────
+                    # STEP 14 — Print latency stats once per second
+                    # ─────────────────────────────────────────────────────────
                     now = time.perf_counter()
                     if now - t_stats >= 1.0:
                         fps = fps_frames / (now - t_fps_ref)
@@ -349,6 +414,9 @@ try:
                     print(f"\nSend error: {e}")
                     break
 
+        # ─────────────────────────────────────────────────────────────────────
+        # STEP 15 — ffmpeg cleanup after inner loop exits
+        # ─────────────────────────────────────────────────────────────────────
         process.terminate()
         process.wait()
         process = None
@@ -356,11 +424,12 @@ try:
         if hwnd is not None:
             set_topmost(hwnd, False)
         if not needs_restart:
-            break
+            break  # clean exit (no window change pending)
 
 except KeyboardInterrupt:
     print("\nStopping stream...")
 finally:
+    # STEP 16 — Final cleanup
     if process:
         process.terminate()
     sock.close()
