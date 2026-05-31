@@ -118,14 +118,16 @@ The sender prompts to select a **monitor** or a specific **window** as the captu
 
 **Drop-stale-frames on receiver:** After each `recvfrom`, the receiver drains the socket in non-blocking mode keeping only the latest packet, so the display always shows the most recently arrived frame.
 
+**Receiver heartbeat:** When no frame arrives for `HEARTBEAT_INTERVAL` seconds, the receiver sends a 4-byte `b'HELO'` packet to the sender's ACK port (5007). Because the sender has DMZ/port forwarding and the receiver may be a regular NAT user, the receiver always initiates this signal — the sender cannot probe the receiver directly. This allows the sender to detect reconnection even through NAT.
+
 **Window capture mode:** Uses `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)` for accurate physical-pixel bounds (no DWM shadow bleed). The window is set `HWND_TOPMOST` during streaming. Frames are skipped when another window is foreground (`GetForegroundWindow`), with a 50ms blackout on startup and focus-regain to prevent stale frames leaking. ffmpeg restarts on window move/resize/minimize (detected by polling the visual rect before each `read1`); `wait_for_window_stable` waits for mouse release + rect to settle before restarting.
 
 ### Tunable constants in `video_udp_sender.py`
 
 | Constant | Default | Effect |
 |---|---|---|
-| `FRAMERATE` | `160` | Capture and encode fps (cap — actual fps = min(FRAMERATE, display_rate)) |
-| `JPEG_QUALITY` | `31` | JPEG quality (2=best/largest, 31=worst/smallest); auto-reduced if frame exceeds UDP limit |
+| `FRAMERATE` | `120` | Capture and encode fps (cap — actual fps = min(FRAMERATE, display_rate)) |
+| `JPEG_QUALITY` | `20` | JPEG quality (2=best/largest, 31=worst/smallest) |
 | `HEIGHT` | `480` | Output height in pixels; width scales to maintain aspect ratio |
 | `ACK_TIMEOUT` | `0.15` | Seconds to wait per ACK stage before counting as lost |
 
@@ -135,6 +137,7 @@ The sender prompts to select a **monitor** or a specific **window** as the captu
 |---|---|---|
 | `DISPLAY_WIDTH` | `1280` | Initial display window width |
 | `DISPLAY_HEIGHT` | `720` | Initial display window height |
+| `HEARTBEAT_INTERVAL` | `2.0` | Seconds of silence before receiver sends a `HELO` heartbeat to the sender |
 
 ### FFmpeg capture pipeline
 
@@ -154,4 +157,4 @@ ffmpeg -filters 2>&1 | Select-String "dda"
 
 ### Frame size constraint
 
-Each MJPEG frame must fit in a single UDP datagram. The 12-byte header reduces the usable payload to 65,495 bytes. If a frame exceeds this, the sender re-encodes at progressively lower quality (steps of 10) until it fits. At `q=31` and 480p, frames are typically 4–30KB — well within the limit.
+Each MJPEG frame must fit in a single UDP datagram. The 12-byte header reduces the usable payload to 65,495 bytes. Frames that exceed this are silently dropped. At `q=20` and 480p, frames are typically 10–50KB — well within the limit.
