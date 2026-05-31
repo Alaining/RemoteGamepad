@@ -10,9 +10,9 @@ from collections import deque
 
 UDP_PORT = 5006
 ACK_PORT = 5007         # receiver sends latency ACKs back to this port
-ACK_TIMEOUT = 0.15      # seconds to wait per ACK stage before counting as lost
-RECEIVER_TIMEOUT = 3.0  # seconds without any packet from receiver before pausing
-PROBE_INTERVAL = 2.0    # seconds between probe frames sent while receiver is gone
+ACK_TIMEOUT = 0.15        # seconds to wait per ACK stage before counting as lost
+MAX_CONSECUTIVE_MISS = 5  # frames with zero ACKs before pausing (~5 × 0.15s ≈ 0.75s)
+PROBE_INTERVAL = 2.0      # seconds between probe frames sent while receiver is gone
 FRAMERATE = 160         # capture and stream frame rate
 JPEG_QUALITY = 20       # 2=best, 31=worst (ffmpeg -q:v scale)
 HEIGHT = 480            # stream height; width auto-scaled to maintain aspect ratio
@@ -199,7 +199,8 @@ t_stats = time.perf_counter()
 t_fps_ref = time.perf_counter()
 
 receiver_ready = True
-last_receiver_contact = time.perf_counter()  # time of last ACK or heartbeat from receiver
+consecutive_miss = 0       # frames with zero ACKs in a row; resets on any ACK or heartbeat
+last_receiver_contact = time.perf_counter()
 last_probe_time = 0.0
 _last_wait_print = 0.0
 
@@ -295,6 +296,7 @@ try:
                     try:
                         ack_sock.recvfrom(64)
                         last_receiver_contact = time.perf_counter()
+                        consecutive_miss = 0
                         receiver_ready = True
                         print("\nReceiver ready, resuming stream.")
                     except (BlockingIOError, OSError):
@@ -362,10 +364,13 @@ try:
                         if t_enc_start is not None:
                             _total.append((t_stages[2] - t_enc_start) / 1e6)
 
-                    if time.perf_counter() - last_receiver_contact > RECEIVER_TIMEOUT:
-                        if receiver_ready:
+                    if t_stages:
+                        consecutive_miss = 0
+                    else:
+                        consecutive_miss += 1
+                        if consecutive_miss >= MAX_CONSECUTIVE_MISS and receiver_ready:
                             print("\nReceiver not responding, pausing stream...")
-                        receiver_ready = False
+                            receiver_ready = False
 
                     # t_prev_done after ACKs so Encode measures only pipe-delivery wait
                     t_prev_done = time.perf_counter_ns()
