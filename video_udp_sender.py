@@ -10,9 +10,8 @@ from collections import deque
 
 UDP_PORT = 5006
 ACK_PORT = 5007         # receiver sends latency ACKs back to this port
-ACK_TIMEOUT = 0.15        # seconds to wait per ACK stage before counting as lost
-MAX_CONSECUTIVE_MISS = 5  # frames with zero ACKs before pausing (~5 × 0.15s ≈ 0.75s)
-PROBE_INTERVAL = 2.0      # seconds between probe frames sent while receiver is gone
+ACK_TIMEOUT = 0.15    # seconds to wait per ACK stage before counting as lost
+PROBE_INTERVAL = 2.0  # seconds between probe frames sent while receiver is gone
 FRAMERATE = 160         # capture and stream frame rate
 JPEG_QUALITY = 20       # 2=best, 31=worst (ffmpeg -q:v scale)
 HEIGHT = 480            # stream height; width auto-scaled to maintain aspect ratio
@@ -197,8 +196,8 @@ t_stats = time.perf_counter()
 t_fps_ref = time.perf_counter()
 
 receiver_ready = True
-consecutive_miss = 0  # frames with zero ACKs in a row; resets on any ACK
 last_probe_time = 0.0
+_prev_ack_miss = 0  # for per-second window loss check
 
 process = None
 needs_restart = False
@@ -303,7 +302,6 @@ try:
                             break
                     ack_sock.settimeout(ACK_TIMEOUT)
                     if _resumed:
-                        consecutive_miss = 0
                         receiver_ready = True
                         print("\nReceiver ready, resuming stream.")
                         continue
@@ -364,14 +362,6 @@ try:
                         if t_enc_start is not None:
                             _total.append((t_stages[2] - t_enc_start) / 1e6)
 
-                    if t_stages:
-                        consecutive_miss = 0
-                    else:
-                        consecutive_miss += 1
-                        if consecutive_miss >= MAX_CONSECUTIVE_MISS and receiver_ready:
-                            print("\nReceiver not responding, pausing stream...")
-                            receiver_ready = False
-
                     # t_prev_done after ACKs so Encode measures only pipe-delivery wait
                     t_prev_done = time.perf_counter_ns()
                     seq += 1
@@ -379,9 +369,18 @@ try:
                     now = time.perf_counter()
                     if now - t_stats >= 1.0:
                         fps = fps_frames / (now - t_fps_ref)
+                        window_frames = fps_frames
                         fps_frames = 0
                         t_fps_ref = now
                         t_stats = now
+
+                        # Detect receiver gone: every frame this second timed out on ACK.
+                        # Uses existing ack_miss counter — zero extra per-frame overhead.
+                        window_miss = ack_miss - _prev_ack_miss
+                        _prev_ack_miss = ack_miss
+                        if receiver_ready and window_frames > 0 and window_miss >= window_frames:
+                            print("\nReceiver not responding, pausing stream...")
+                            receiver_ready = False
 
                         def a(d):
                             return f"{sum(d)/len(d):.1f}" if d else "---"
