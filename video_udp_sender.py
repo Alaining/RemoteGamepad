@@ -3,6 +3,7 @@ import sys
 import socket
 import struct
 import time
+import msvcrt
 import ctypes
 import ctypes.wintypes
 from collections import deque
@@ -81,6 +82,21 @@ def wait_for_window_stable(hwnd):
         if curr == prev:
             break
         prev = curr
+
+
+def drain_pipe(pipe):
+    """Read all currently buffered pipe data without blocking (Windows only).
+    Uses PeekNamedPipe to know exactly how many bytes are ready so read1()
+    never blocks, clearing the stale-frame backlog that builds up during ACK waits."""
+    avail = ctypes.c_ulong(0)
+    handle = ctypes.c_void_p(msvcrt.get_osfhandle(pipe.fileno()))
+    data = b""
+    while True:
+        ctypes.windll.kernel32.PeekNamedPipe(handle, None, 0, None, ctypes.byref(avail), None)
+        if avail.value == 0:
+            break
+        data += pipe.read1(min(65536, avail.value))
+    return data
 
 
 def build_window_lavfi(hwnd):
@@ -230,10 +246,10 @@ try:
                     needs_restart = True
                     break
 
-            chunk = process.stdout.read1(65536)
+            chunk = process.stdout.read1(65536)  # blocks until first bytes arrive
             if not chunk:
                 break
-            buf += chunk
+            buf += chunk + drain_pipe(process.stdout)  # drain any backlog without blocking
 
             # Extract all complete JPEG frames; keep only the latest —
             # frames that piled up during ACK wait are dropped.

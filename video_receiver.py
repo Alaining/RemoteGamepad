@@ -1,6 +1,7 @@
 import socket
 import sys
 import time
+import ctypes
 
 try:
     import cv2
@@ -23,6 +24,7 @@ DISPLAY_HEIGHT = 720
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
 sock.bind(("0.0.0.0", UDP_PORT))
+sock.settimeout(0.1)  # allows Ctrl+C and window-close checks even when no frames arrive
 print(f"Listening on port {UDP_PORT}... (press Q in the video window to quit)")
 
 _canvas      = None
@@ -44,16 +46,56 @@ def letterbox(frame, win_w, win_h):
     _canvas[y:y+nh, x:x+nw] = resized
     return _canvas
 
+def window_closed():
+    return cv2.getWindowProperty("RemoteGamepad", cv2.WND_PROP_VISIBLE) < 1
+
 cv2.namedWindow("RemoteGamepad", cv2.WINDOW_NORMAL)
 cv2.resizeWindow("RemoteGamepad", DISPLAY_WIDTH, DISPLAY_HEIGHT)
+
+# Fix cursor: OpenCV registers its window class with a crosshair cursor.
+# We change GCLP_HCURSOR on the top-level window AND all child windows
+# (the image area is a child HWND with its own class cursor).
+_arrow = ctypes.windll.user32.LoadCursorW(None, 32512)  # IDC_ARROW
+_hwnd = 0
+for _ in range(10):                                      # wait up to 100ms for window to exist
+    cv2.waitKey(10)
+    _hwnd = ctypes.windll.user32.FindWindowW(None, "RemoteGamepad")
+    if _hwnd:
+        break
+if _hwnd:
+    ctypes.windll.user32.SetClassLongPtrW(_hwnd, -12, _arrow)  # GCLP_HCURSOR on parent
+    _EnumProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    @_EnumProc
+    def _fix_child(child, _):
+        ctypes.windll.user32.SetClassLongPtrW(child, -12, _arrow)
+        return True
+    ctypes.windll.user32.EnumChildWindows(_hwnd, _fix_child, 0)
+
 
 frames_shown   = 0
 frames_dropped = 0
 t_stats = time.perf_counter()
 
+# Drain any packets buffered by the OS while the receiver was not running,
+# including frames that arrived during the window/cursor setup above.
+sock.setblocking(False)
+while True:
+    try:
+        sock.recvfrom(65536)
+    except (BlockingIOError, OSError):
+        break
+sock.settimeout(0.1)
+
 try:
     while True:
-        data, addr = sock.recvfrom(65536)
+        try:
+            data, addr = sock.recvfrom(65536)
+        except socket.timeout:
+            # No frame arrived — check if the window was closed
+            cv2.pollKey()
+            if window_closed():
+                break
+            continue
 
         # Drain any backlogged frames — discard all but the latest so we never
         # fall behind. Frames skipped here will time out as ACK losses on the sender.
@@ -65,7 +107,7 @@ try:
                 frames_dropped += 1
         except (BlockingIOError, OSError):
             pass
-        sock.setblocking(True)
+        sock.settimeout(0.1)  # restore timeout (not setblocking(True) which would clear it)
 
         ack_addr = (addr[0], ACK_PORT)
 
@@ -104,7 +146,7 @@ try:
             frames_dropped = 0
             t_stats = now
 
-        if key == ord('q') or key == ord('Q'):
+        if key == ord('q') or key == ord('Q') or window_closed():
             break
 
 except KeyboardInterrupt:

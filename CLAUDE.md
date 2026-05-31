@@ -100,7 +100,11 @@ python video_udp_sender.py
 python video_udp_sender.py 192.168.1.50
 ```
 
+The sender prompts to select a **monitor** or a specific **window** as the capture source.
+
 **Data flow:** `ddagrab (GPU framebuffer)` → MJPEG via FFmpeg pipe → Python → UDP port 5006 → `cv2.imdecode` → `cv2.imshow`
+
+**Latency ACK protocol:** After each frame send, the sender waits synchronously on port 5007 for three ACKs from the receiver. Each ACK is 13 bytes: `[seq:4B][timestamp_ns:8B][stage:1B]`. Stages: `0`=received, `1`=decoded, `2`=drawn. The sender uses its own clock throughout (receiver just echoes the header). Metrics printed each second: `Total`, `Encode` (pipe wait), `SendCall`, `Net` (RTT÷2), `Decode`, `Draw`, `RTT`, `FPS`, `Loss%`.
 
 ### Key design decisions
 
@@ -110,17 +114,27 @@ python video_udp_sender.py 192.168.1.50
 
 **Why UDP instead of TCP:** TCP buffers frames in the send/receive queue. If the receiver is briefly slow, TCP queues multiple frames — causing the display to lag behind. UDP is fire-and-forget; old frames are simply dropped, keeping the display at the latest available frame.
 
-**Drop-stale-frames on sender:** The Python loop reads from the FFmpeg pipe with `read1()` (non-blocking, returns whatever is immediately available). If multiple frames accumulate in the buffer during a slow iteration, only the latest complete JPEG is sent — older ones are discarded. This prevents the latency from growing over time.
+**Drop-stale-frames on sender:** `read1()` returns whatever is immediately available from the pipe. If multiple frames accumulate during an ACK wait, only the latest complete JPEG is sent — older ones are discarded. `read1()` is used instead of `read(n)` because `read(n)` blocks until the buffer has n bytes, which would accumulate ~16 frames before returning at `q=31`.
 
-**Why `read1()` not `read()`:** `read(n)` blocks until the buffer has n bytes. At low JPEG quality (`q=31`) with ~4KB frames, `read(65536)` would accumulate ~16 frames before returning, causing burst delivery. `read1()` returns as soon as any bytes are available.
+**Drop-stale-frames on receiver:** After each `recvfrom`, the receiver drains the socket in non-blocking mode keeping only the latest packet, so the display always shows the most recently arrived frame.
+
+**Window capture mode:** Uses `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)` for accurate physical-pixel bounds (no DWM shadow bleed). The window is set `HWND_TOPMOST` during streaming. Frames are skipped when another window is foreground (`GetForegroundWindow`), with a 50ms blackout on startup and focus-regain to prevent stale frames leaking. ffmpeg restarts on window move/resize/minimize (detected by polling the visual rect before each `read1`); `wait_for_window_stable` waits for mouse release + rect to settle before restarting.
 
 ### Tunable constants in `video_udp_sender.py`
 
 | Constant | Default | Effect |
 |---|---|---|
-| `FRAMERATE` | `30` | Capture and encode fps |
-| `JPEG_QUALITY` | `31` | JPEG quality (2=best/largest, 31=worst/smallest) |
+| `FRAMERATE` | `160` | Capture and encode fps (cap — actual fps = min(FRAMERATE, display_rate)) |
+| `JPEG_QUALITY` | `31` | JPEG quality (2=best/largest, 31=worst/smallest); auto-reduced if frame exceeds UDP limit |
 | `HEIGHT` | `480` | Output height in pixels; width scales to maintain aspect ratio |
+| `ACK_TIMEOUT` | `0.15` | Seconds to wait per ACK stage before counting as lost |
+
+### Tunable constants in `video_receiver.py`
+
+| Constant | Default | Effect |
+|---|---|---|
+| `DISPLAY_WIDTH` | `1280` | Initial display window width |
+| `DISPLAY_HEIGHT` | `720` | Initial display window height |
 
 ### FFmpeg capture pipeline
 
@@ -140,4 +154,4 @@ ffmpeg -filters 2>&1 | Select-String "dda"
 
 ### Frame size constraint
 
-Each MJPEG frame must fit in a single UDP datagram (≤ 65,507 bytes). At `q=31` and 480p, frames are typically 4–30KB — well within the limit. At higher quality or resolution, frames may exceed this and be silently dropped by the sender (`len(latest_frame) <= 65507` guard). Switch to TCP if higher quality is needed.
+Each MJPEG frame must fit in a single UDP datagram. The 12-byte header reduces the usable payload to 65,495 bytes. If a frame exceeds this, the sender re-encodes at progressively lower quality (steps of 10) until it fits. At `q=31` and 480p, frames are typically 4–30KB — well within the limit.
