@@ -202,7 +202,6 @@ receiver_ready = True
 consecutive_miss = 0       # frames with zero ACKs in a row; resets on any ACK or heartbeat
 last_receiver_contact = time.perf_counter()
 last_probe_time = 0.0
-_last_wait_print = 0.0
 
 process = None
 needs_restart = False
@@ -291,22 +290,30 @@ try:
                     continue  # inside blackout window (startup or focus regain)
 
                 if not receiver_ready:
-                    # Any packet on ack_sock (ACK or heartbeat) means receiver is back
+                    # Drain ack_sock and look for a genuine "alive" signal:
+                    # - probe ACK: 13-byte packet whose seq matches our current probe seq
+                    # - receiver heartbeat: b'HELO' sent proactively by the receiver
+                    # Delayed ACKs from frames sent before the disconnect have a lower seq
+                    # and are therefore ignored, preventing false resumes.
                     ack_sock.setblocking(False)
-                    try:
-                        ack_sock.recvfrom(64)
-                        last_receiver_contact = time.perf_counter()
+                    _resumed = False
+                    while True:
+                        try:
+                            _pkt, _ = ack_sock.recvfrom(64)
+                            _is_probe_ack = (len(_pkt) == 13 and
+                                             struct.unpack(">I", _pkt[:4])[0] == (seq & 0xFFFFFFFF))
+                            if _is_probe_ack or _pkt == b'HELO':
+                                _resumed = True
+                        except (BlockingIOError, OSError):
+                            break
+                    ack_sock.settimeout(ACK_TIMEOUT)
+                    if _resumed:
                         consecutive_miss = 0
                         receiver_ready = True
                         print("\nReceiver ready, resuming stream.")
-                    except (BlockingIOError, OSError):
-                        pass
-                    ack_sock.settimeout(ACK_TIMEOUT)
-                    _pnow = time.perf_counter()
-                    if _pnow - _last_wait_print >= 2.0:
-                        print("Waiting for receiver...", end='\r')
-                        _last_wait_print = _pnow
+                        continue
                     # Send a probe frame every PROBE_INTERVAL (lets receiver respond on LAN)
+                    _pnow = time.perf_counter()
                     if _pnow - last_probe_time >= PROBE_INTERVAL:
                         last_probe_time = _pnow
                         _phdr = struct.pack(">IQ", seq & 0xFFFFFFFF, time.perf_counter_ns())
