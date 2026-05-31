@@ -10,8 +10,7 @@ from collections import deque
 
 UDP_PORT = 5006
 ACK_PORT = 5007         # receiver sends latency ACKs back to this port
-ACK_TIMEOUT = 0.15    # seconds to wait per ACK stage before counting as lost
-PROBE_INTERVAL = 2.0  # seconds between probe frames sent while receiver is gone
+ACK_TIMEOUT = 0.15      # seconds to wait per ACK stage before counting as lost
 FRAMERATE = 160         # capture and stream frame rate
 JPEG_QUALITY = 20       # 2=best, 31=worst (ffmpeg -q:v scale)
 HEIGHT = 480            # stream height; width auto-scaled to maintain aspect ratio
@@ -195,10 +194,6 @@ t_prev_done = None  # set after ACK collection; Encode measures from here to nex
 t_stats = time.perf_counter()
 t_fps_ref = time.perf_counter()
 
-receiver_ready = True
-last_probe_time = 0.0
-_prev_ack_miss = 0  # for per-second window loss check
-
 process = None
 needs_restart = False
 try:
@@ -282,40 +277,6 @@ try:
 
                 if _now_ns < _hold_until_ns:
                     continue  # inside blackout window (startup or focus regain)
-
-                if not receiver_ready:
-                    # Drain ack_sock and look for a genuine "alive" signal:
-                    # - probe ACK: 13-byte packet whose seq matches our current probe seq
-                    # - receiver heartbeat: b'HELO' sent proactively by the receiver
-                    # Delayed ACKs from frames sent before the disconnect have a lower seq
-                    # and are therefore ignored, preventing false resumes.
-                    ack_sock.setblocking(False)
-                    _resumed = False
-                    while True:
-                        try:
-                            _pkt, _ = ack_sock.recvfrom(64)
-                            _is_probe_ack = (len(_pkt) == 13 and
-                                             struct.unpack(">I", _pkt[:4])[0] == (seq & 0xFFFFFFFF))
-                            if _is_probe_ack or _pkt == b'HELO':
-                                _resumed = True
-                        except (BlockingIOError, OSError):
-                            break
-                    ack_sock.settimeout(ACK_TIMEOUT)
-                    if _resumed:
-                        receiver_ready = True
-                        print("\nReceiver ready, resuming stream.")
-                        continue
-                    # Send a probe frame every PROBE_INTERVAL (lets receiver respond on LAN)
-                    _pnow = time.perf_counter()
-                    if _pnow - last_probe_time >= PROBE_INTERVAL:
-                        last_probe_time = _pnow
-                        _phdr = struct.pack(">IQ", seq & 0xFFFFFFFF, time.perf_counter_ns())
-                        try:
-                            sock.sendto(_phdr + latest_frame, (ip, UDP_PORT))
-                        except OSError:
-                            pass
-                    continue
-
                 try:
                     t_enc_start = t_prev_done
                     if t_enc_start is not None:
@@ -369,18 +330,9 @@ try:
                     now = time.perf_counter()
                     if now - t_stats >= 1.0:
                         fps = fps_frames / (now - t_fps_ref)
-                        window_frames = fps_frames
                         fps_frames = 0
                         t_fps_ref = now
                         t_stats = now
-
-                        # Detect receiver gone: every frame this second timed out on ACK.
-                        # Uses existing ack_miss counter — zero extra per-frame overhead.
-                        window_miss = ack_miss - _prev_ack_miss
-                        _prev_ack_miss = ack_miss
-                        if receiver_ready and window_frames > 0 and window_miss >= window_frames:
-                            print("\nReceiver not responding, pausing stream...")
-                            receiver_ready = False
 
                         def a(d):
                             return f"{sum(d)/len(d):.1f}" if d else "---"
