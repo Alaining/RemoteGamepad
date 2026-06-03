@@ -16,10 +16,10 @@ from collections import deque  # fixed-length rolling buffer for latency statist
 # ─────────────────────────────────────────────────────────────────────────────
 UDP_PORT = 5006
 ACK_PORT = 5007         # receiver sends latency ACKs back to this port
-ACK_TIMEOUT = 0.15      # seconds to wait per ACK stage before counting as lost
-FRAMERATE = 120         # capture and stream frame rate
-JPEG_QUALITY = 20       # 2=best/largest, 31=worst/smallest (ffmpeg -q:v scale)
-HEIGHT = 480            # stream height; width auto-scaled to maintain aspect ratio
+ACK_TIMEOUT = 0.025     # seconds to wait per ACK stage; 25ms gives 6x headroom over the ~4ms LAN RTT
+FRAMERATE = 165         # capture and stream frame rate
+JPEG_QUALITY = 29       # 2=best/largest, 31=worst/smallest (ffmpeg -q:v scale)
+HEIGHT = 240            # stream height; width auto-scaled to maintain aspect ratio
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 3 — JPEG frame delimiters
@@ -230,6 +230,8 @@ fps_frames = 0    # frames sent since the last stats print; reset every second
 t_prev_done = None  # timestamp after previous frame's ACK collection; next Encode is measured from here
 t_stats = time.perf_counter()
 t_fps_ref = time.perf_counter()
+t_last_send = None  # perf_counter timestamp of the most recently sent frame; used for RTT backpressure
+drop_count = 0      # frames skipped this second because send interval was shorter than 1/max_fps
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 11 — Outer loop: (re)start ffmpeg
@@ -334,6 +336,17 @@ try:
 
                 if _now_ns < _hold_until_ns:
                     continue  # inside blackout window (startup or focus regain)
+
+                # Drop this frame if we're sending faster than 70% of 1/RTT.
+                # Use _net (stage-0 network RTT) rather than _rtt (end-to-end including imshow)
+                # so that receiver display slowdowns don't incorrectly throttle the send rate.
+                if _net and t_last_send is not None:
+                    avg_net_rtt_ms = sum(_net) / len(_net)
+                    if time.perf_counter() - t_last_send < avg_net_rtt_ms / 700.0:
+                        drop_count += 1
+                        continue
+                t_last_send = time.perf_counter()
+
                 try:
                     t_enc_start = t_prev_done
                     if t_enc_start is not None:
@@ -360,11 +373,13 @@ try:
                             break
                     ack_sock.settimeout(ACK_TIMEOUT)
 
-                    # Collect up to 3 stage ACKs (0=received, 1=decoded, 2=drawn).
-                    # Break on first timeout — no point waiting for later stages if an earlier one missed.
-                    # ACKs are matched by seq so late arrivals from prior frames are ignored.
+                    # Collect stage 0 (received) and 1 (decoded) with timeout — these are fast (~4ms, ~6ms).
+                    # Stage 2 (imshow done) is NOT awaited: cv2.imshow on the receiver can stall 30-100ms
+                    # when the Windows compositor is slow, which would freeze the sender for that entire time.
+                    # Instead we do one non-blocking peek after stage 1 to capture stage 2 for stats when
+                    # it has already arrived, without ever blocking on it.
                     t_stages = {}
-                    for _ in range(3):
+                    for _ in range(2):
                         try:
                             data, _ = ack_sock.recvfrom(13)
                             if len(data) == 13:
@@ -374,6 +389,16 @@ try:
                         except socket.timeout:
                             ack_miss += 1
                             break
+                    ack_sock.setblocking(False)
+                    try:
+                        data, _ = ack_sock.recvfrom(13)
+                        if len(data) == 13:
+                            ack_seq, _, stage = struct.unpack(">IQB", data)
+                            if ack_seq == (seq & 0xFFFFFFFF) and stage == 2:
+                                t_stages[2] = time.perf_counter_ns()
+                    except Exception:
+                        pass
+                    ack_sock.settimeout(ACK_TIMEOUT)
 
                     if 0 in t_stages:
                         _net.append((t_stages[0] - t0) / 1e6)           # stage-0 RTT ÷ 2 ≈ one-way network
@@ -398,6 +423,8 @@ try:
                         fps_frames = 0
                         t_fps_ref = now
                         t_stats = now
+                        drops_this_sec = drop_count
+                        drop_count = 0
 
                         def a(d):
                             return f"{sum(d)/len(d):.1f}" if d else "---"
@@ -407,7 +434,7 @@ try:
                             f"Total:{a(_total)}ms  "
                             f"[Encode:{a(_enc)}ms  SendCall:{a(_snd)}ms  Net:{net_est}ms  "
                             f"Decode:{a(_dec)}ms  Draw:{a(_drw)}ms  RTT:{a(_rtt)}ms]  "
-                            f"FPS:{fps:.1f}  Loss:{loss}%"
+                            f"FPS:{fps:.1f}  Loss:{loss}%  Dropped:{drops_this_sec}/s"
                         )
 
                 except OSError as e:
