@@ -43,7 +43,8 @@ print(f"Listening on port {UDP_PORT}... (press Q or close the window to quit)")
 #   lower DWM buffering latency than OpenCV's GDI path (~1 vsync vs ~2 vsyncs).
 # ─────────────────────────────────────────────────────────────────────────────
 pygame.init()
-screen = pygame.display.set_mode((DISPLAY_WIDTH, DISPLAY_HEIGHT), pygame.RESIZABLE)
+screen        = pygame.display.set_mode((DISPLAY_WIDTH, DISPLAY_HEIGHT), pygame.RESIZABLE)
+is_fullscreen = False
 pygame.display.set_caption("RemoteGamepad")
 font = pygame.font.SysFont("Arial", 22)
 
@@ -76,11 +77,19 @@ sock.settimeout(0.1)
 # ─────────────────────────────────────────────────────────────────────────────
 def pump_events():
     """Drain the pygame event queue. Returns True if the user requested quit."""
+    global screen, is_fullscreen
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             return True
-        if event.type == pygame.KEYDOWN and event.key == pygame.K_q:
-            return True
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_q:
+                return True
+            if event.key == pygame.K_F11:
+                is_fullscreen = not is_fullscreen
+                if is_fullscreen:
+                    screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+                else:
+                    screen = pygame.display.set_mode((DISPLAY_WIDTH, DISPLAY_HEIGHT), pygame.RESIZABLE)
     return False
 
 # ─────────────────────────────────────────────────────────────────────────────
