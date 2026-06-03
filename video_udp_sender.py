@@ -18,8 +18,8 @@ UDP_PORT = 5006
 ACK_PORT = 5007         # receiver sends latency ACKs back to this port
 ACK_TIMEOUT = 0.025     # seconds to wait per ACK stage; 25ms gives 6x headroom over the ~4ms LAN RTT
 FRAMERATE = 165         # capture and stream frame rate
-JPEG_QUALITY = 25       # 2=best/largest, 31=worst/smallest (ffmpeg -q:v scale)
-HEIGHT = 240            # stream height; width auto-scaled to maintain aspect ratio
+JPEG_QUALITY = 15       # 2=best/largest, 31=worst/smallest (ffmpeg -q:v scale)
+HEIGHT = 480            # stream height; width auto-scaled to maintain aspect ratio
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 3 — JPEG frame delimiters
@@ -204,7 +204,7 @@ print("Run video_receiver.py on the receiver to watch.\n")
 # STEP 9 — Socket setup
 # ─────────────────────────────────────────────────────────────────────────────
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)  # small send buffer: prevents OS from queuing multiple frames ahead of us
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 256 * 1024)  # large enough for one full-quality frame; too small caused sendto() to block on WiFi
 
 ack_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # separate socket so ACK reads never interfere with frame sends
 ack_sock.bind(("0.0.0.0", ACK_PORT))
@@ -223,6 +223,7 @@ _dec   = deque(maxlen=WINDOW)  # stage-1 minus stage-0: imdecode time on the rec
 _drw   = deque(maxlen=WINDOW)  # stage-2 minus stage-1: imshow + pollKey time on the receiver
 _rtt   = deque(maxlen=WINDOW)  # sendto to stage-2: round-trip until the frame is on screen
 _total = deque(maxlen=WINDOW)  # previous ACK-done to stage-2: true end-to-end viewer latency
+_fsz   = deque(maxlen=WINDOW)  # JPEG frame size in bytes; reveals IP fragmentation pressure
 
 ack_miss = 0      # cumulative ACK stage timeouts across all frames
 total_frames = 0  # cumulative frames sent (denominator for loss%)
@@ -361,6 +362,7 @@ try:
                     sock.sendto(header + latest_frame, (ip, UDP_PORT))
                     t1 = time.perf_counter_ns()
                     _snd.append((t1 - t0) / 1e6)
+                    _fsz.append(len(latest_frame))
                     total_frames += 1
                     fps_frames += 1
 
@@ -439,10 +441,11 @@ try:
                             _e2e_send_ms = e2e
                         else:
                             e2e_str = "---"
+                        frags = f"{sum(_fsz)/len(_fsz)/1024:.1f}KB ({int(sum(_fsz)/len(_fsz)/1472)+1} frags)" if _fsz else "---"
                         print(
                             f"E2E:{e2e_str}ms  "
                             f"[Encode:{a(_enc)}ms  Net:{net_est}ms  Decode:{a(_dec)}ms]  "
-                            f"FPS:{fps:.1f}  Loss:{loss}%  Dropped:{drops_this_sec}/s"
+                            f"FPS:{fps:.1f}  Loss:{loss}%  Dropped:{drops_this_sec}/s  Frame:{frags}"
                         )
 
                 except OSError as e:

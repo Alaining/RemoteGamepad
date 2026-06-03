@@ -32,7 +32,7 @@ DISPLAY_HEIGHT = 720         # initial window height
 # STEP 3 — Socket setup
 # ─────────────────────────────────────────────────────────────────────────────
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)  # small buffer: OS drops stale packets when full
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)  # 1MB: must fit at least one fully-reassembled frame; drain loop prevents queuing lag
 sock.bind(("0.0.0.0", UDP_PORT))
 sock.settimeout(0.1)  # short timeout so heartbeat and quit checks run even when idle
 print(f"Listening on port {UDP_PORT}... (press Q or close the window to quit)")
