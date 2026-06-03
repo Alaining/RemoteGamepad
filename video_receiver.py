@@ -5,13 +5,13 @@ import socket
 import struct
 import sys
 import time
-import ctypes  # Win32 APIs: find/fix the OpenCV window cursor
 
 try:
-    import cv2       # decode JPEG frames and display them in a window
-    import numpy as np  # wrap raw bytes into an array that cv2.imdecode can read
+    import cv2        # JPEG decode only — display is handled by pygame
+    import numpy as np
+    import pygame
 except ImportError:
-    print("Missing dependencies. Run: pip install opencv-python")
+    print("Missing dependencies. Run: pip install opencv-python pygame")
     sys.exit(1)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -19,94 +19,49 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 UDP_PORT = 5006
 ACK_PORT = 5007              # sender listens here for latency ACKs
-HEARTBEAT_INTERVAL = 2.0     # seconds between heartbeats sent to sender when no frames arrive
+HEARTBEAT_INTERVAL = 2.0     # seconds between heartbeats sent to sender when idle
 
 DISPLAY_WIDTH  = 1280        # initial window width  (user can resize freely)
 DISPLAY_HEIGHT = 720         # initial window height
 
-# Each received packet: [seq: 4B][timestamp_ns: 8B][JPEG data]
-# Each ACK sent back:   [seq: 4B][timestamp_ns: 8B][stage: 1B]
-# Stages: 0=received, 1=decoded, 2=drawn — sender uses these to measure per-stage latency.
-# All timestamps are the sender's; receiver never does time calculations.
+# Frame packet: [seq: 4B][timestamp_ns: 8B][e2e_ms: 2B][JPEG data]
+# ACK packet:   [seq: 4B][timestamp_ns: 8B][stage: 1B]  (first 12B of header echoed verbatim)
+# Stages: 0=received, 1=decoded, 2=drawn
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 3 — Socket setup
 # ─────────────────────────────────────────────────────────────────────────────
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)  # small receive buffer: OS drops old packets when full, preventing queuing
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)  # small buffer: OS drops stale packets when full
 sock.bind(("0.0.0.0", UDP_PORT))
-sock.settimeout(0.1)  # short timeout so Ctrl+C and window-close checks run even when no frames arrive
-print(f"Listening on port {UDP_PORT}... (press Q in the video window to quit)")
+sock.settimeout(0.1)  # short timeout so heartbeat and quit checks run even when idle
+print(f"Listening on port {UDP_PORT}... (press Q or close the window to quit)")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 4 — Letterbox helper: fit frame inside display window with black bars
+# STEP 4 — pygame window and font setup
+#   pygame uses SDL2 with DXGI flip-model presentation on Windows, which has
+#   lower DWM buffering latency than OpenCV's GDI path (~1 vsync vs ~2 vsyncs).
 # ─────────────────────────────────────────────────────────────────────────────
-_canvas      = None       # reused black backing canvas (avoids reallocating every frame)
-_canvas_size = (0, 0)     # tracks current canvas dimensions so we only reallocate on resize
-
-def letterbox(frame, win_w, win_h):
-    global _canvas, _canvas_size
-    h, w = frame.shape[:2]
-    scale = min(win_w / w, win_h / h)
-    nw, nh = int(w * scale), int(h * scale)
-    resized = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
-    if _canvas_size != (win_w, win_h):
-        _canvas      = np.zeros((win_h, win_w, 3), dtype=np.uint8)
-        _canvas_size = (win_w, win_h)
-    else:
-        _canvas[:] = 0
-    y = (win_h - nh) // 2
-    x = (win_w  - nw) // 2
-    _canvas[y:y+nh, x:x+nw] = resized
-    return _canvas
-
-def window_closed():
-    return cv2.getWindowProperty("RemoteGamepad", cv2.WND_PROP_VISIBLE) < 1
+pygame.init()
+screen = pygame.display.set_mode((DISPLAY_WIDTH, DISPLAY_HEIGHT), pygame.RESIZABLE)
+pygame.display.set_caption("RemoteGamepad")
+font = pygame.font.SysFont("Arial", 22)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 5 — Create the display window
+# STEP 5 — Stats and heartbeat state
 # ─────────────────────────────────────────────────────────────────────────────
-cv2.namedWindow("RemoteGamepad", cv2.WINDOW_NORMAL)
-cv2.resizeWindow("RemoteGamepad", DISPLAY_WIDTH, DISPLAY_HEIGHT)
+frames_shown        = 0
+frames_dropped      = 0
+t_stats             = time.perf_counter()
+display_fps         = 0.0  # updated once per second, drawn on each frame
+display_e2e         = 0    # E2E ms from sender header, drawn on each frame
+
+known_ack_addr      = None
+last_frame_time     = time.perf_counter()
+last_heartbeat_time = 0.0
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 6 — Fix cursor: OpenCV registers its window class with a crosshair.
-#   We replace it with the standard arrow on the top-level HWND and all child
-#   HWNDs (the image canvas is a separate child window with its own class cursor).
-# ─────────────────────────────────────────────────────────────────────────────
-_arrow = ctypes.windll.user32.LoadCursorW(None, 32512)  # IDC_ARROW
-_hwnd = 0
-for _ in range(10):                                      # wait up to 100ms for window to exist
-    cv2.waitKey(10)
-    _hwnd = ctypes.windll.user32.FindWindowW(None, "RemoteGamepad")
-    if _hwnd:
-        break
-if _hwnd:
-    ctypes.windll.user32.SetClassLongPtrW(_hwnd, -12, _arrow)  # GCLP_HCURSOR on parent
-    _EnumProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
-    @_EnumProc
-    def _fix_child(child, _):
-        ctypes.windll.user32.SetClassLongPtrW(child, -12, _arrow)
-        return True
-    ctypes.windll.user32.EnumChildWindows(_hwnd, _fix_child, 0)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 7 — Stats and heartbeat state
-# ─────────────────────────────────────────────────────────────────────────────
-frames_shown   = 0   # frames displayed this stats window
-frames_dropped = 0   # packets discarded by the drain loop this stats window
-t_stats = time.perf_counter()
-display_fps    = 0.0 # last computed FPS, drawn on each frame as an overlay
-display_e2e    = 0   # latest E2E latency (ms) received from sender header, drawn on each frame
-
-known_ack_addr    = None  # sender's (ip, ACK_PORT), learned from the first received frame
-last_frame_time   = time.perf_counter()  # time of the last successfully received frame
-last_heartbeat_time = 0.0  # time of the last HELO sent to the sender
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 8 — Startup drain: discard packets that arrived before we were ready
-#   Frames may have accumulated in the OS socket buffer during the window/cursor
-#   setup above. Drain them so we start fresh with the latest frame.
+# STEP 6 — Startup drain: discard packets that arrived before we were ready
 # ─────────────────────────────────────────────────────────────────────────────
 sock.setblocking(False)
 while True:
@@ -117,104 +72,121 @@ while True:
 sock.settimeout(0.1)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 9 — Main receive loop
+# STEP 7 — Event helper
+# ─────────────────────────────────────────────────────────────────────────────
+def pump_events():
+    """Drain the pygame event queue. Returns True if the user requested quit."""
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            return True
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_q:
+            return True
+    return False
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 8 — Main receive loop
 # ─────────────────────────────────────────────────────────────────────────────
 try:
     while True:
         try:
-            data, addr = sock.recvfrom(65536)  # blocks up to 0.1s waiting for the next frame
+            data, addr = sock.recvfrom(65536)  # blocks up to 0.1s
         except socket.timeout:
-            # No frame arrived — send a heartbeat to the sender so it knows we're alive.
-            # Only sent if no frame (or heartbeat) has been exchanged for HEARTBEAT_INTERVAL seconds.
             if known_ack_addr is not None:
                 _now = time.perf_counter()
                 if _now - max(last_frame_time, last_heartbeat_time) >= HEARTBEAT_INTERVAL:
-                    sock.sendto(b'HELO', known_ack_addr)  # 4-byte signal; sender recognises this as "receiver alive"
+                    sock.sendto(b'HELO', known_ack_addr)
                     last_heartbeat_time = _now
-            cv2.pollKey()
-            if window_closed():
+            if pump_events():
                 break
             continue
 
         # ─────────────────────────────────────────────────────────────────────
-        # STEP 10 — Drain backlogged frames: keep only the latest
-        #   If frames accumulated while we were decoding/displaying, discard all
-        #   but the newest so we never fall behind. Skipped packets time out as
-        #   ACK losses on the sender side — that's intentional.
+        # STEP 9 — Drain backlogged frames: keep only the latest
         # ─────────────────────────────────────────────────────────────────────
         sock.setblocking(False)
         try:
             while True:
                 newer, newer_addr = sock.recvfrom(65536)
-                data, addr = newer, newer_addr  # update to the newest packet
+                data, addr = newer, newer_addr
                 frames_dropped += 1
         except (BlockingIOError, OSError):
             pass
-        sock.settimeout(0.1)  # restore timeout (not setblocking(True) which would clear it)
+        sock.settimeout(0.1)
 
-        ack_addr = (addr[0], ACK_PORT)  # where to send ACKs back to
-        known_ack_addr = ack_addr
+        ack_addr        = (addr[0], ACK_PORT)
+        known_ack_addr  = ack_addr
         last_frame_time = time.perf_counter()
 
         if len(data) < 14:
             continue
-        header = data[:12]   # seq + timestamp only — echoed back verbatim in every ACK
-        display_e2e = struct.unpack(">H", data[12:14])[0]
-        jpeg = data[14:]
+        header      = data[:12]                             # seq + timestamp_ns, echoed in ACKs
+        display_e2e = struct.unpack(">H", data[12:14])[0]  # E2E ms from sender
+        jpeg        = data[14:]
 
         # ─────────────────────────────────────────────────────────────────────
-        # STEP 11 — ACK stage 0: frame received (before any processing)
+        # STEP 10 — ACK stage 0: frame received
         # ─────────────────────────────────────────────────────────────────────
         sock.sendto(header + b'\x00', ack_addr)
 
-        frame = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)  # decode JPEG bytes → BGR numpy array
+        frame = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
 
         # ─────────────────────────────────────────────────────────────────────
-        # STEP 12 — ACK stage 1: decode complete
+        # STEP 11 — ACK stage 1: decode complete
         # ─────────────────────────────────────────────────────────────────────
         sock.sendto(header + b'\x01', ack_addr)
 
         if frame is not None:
-            r = cv2.getWindowImageRect("RemoteGamepad")
-            win_w = r[2] if r[2] > 0 else DISPLAY_WIDTH
-            win_h = r[3] if r[3] > 0 else DISPLAY_HEIGHT
-            display = letterbox(frame, win_w, win_h)
-            if display_fps > 0:
-                cv2.rectangle(display, (5, 5), (130, 58), (0, 0, 0), -1)
-                cv2.putText(display, f"FPS {display_fps:.0f}", (10, 25),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
-                cv2.putText(display, f"E2E {display_e2e}ms", (10, 50),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
-            cv2.imshow("RemoteGamepad", display)
+            # cv2 returns BGR; pygame needs RGB
+            rgb  = frame[:, :, ::-1]
+            surf = pygame.image.frombuffer(rgb.tobytes(),
+                                           (rgb.shape[1], rgb.shape[0]), 'RGB')
 
-        key = cv2.pollKey()  # pump the OpenCV event loop without sleeping (avoids vsync lock)
+            # Letterbox: scale to fit window preserving aspect ratio
+            win_w, win_h = screen.get_size()
+            fw, fh = surf.get_size()
+            scale  = min(win_w / fw, win_h / fh)
+            sw, sh = int(fw * scale), int(fh * scale)
+            scaled = pygame.transform.smoothscale(surf, (sw, sh))
+
+            screen.fill((0, 0, 0))
+            screen.blit(scaled, ((win_w - sw) // 2, (win_h - sh) // 2))
+
+            # Overlay: FPS and E2E in the top-left corner
+            if display_fps > 0:
+                fps_surf = font.render(f"FPS {display_fps:.0f}", True, (0, 255, 0))
+                e2e_surf = font.render(f"E2E {display_e2e}ms",   True, (0, 255, 0))
+                box_w    = max(fps_surf.get_width(), e2e_surf.get_width()) + 16
+                pygame.draw.rect(screen, (0, 0, 0), (5, 5, box_w, 55))
+                screen.blit(fps_surf, (10, 8))
+                screen.blit(e2e_surf, (10, 31))
+
+            pygame.display.flip()
 
         # ─────────────────────────────────────────────────────────────────────
-        # STEP 13 — ACK stage 2: frame is on screen
+        # STEP 12 — ACK stage 2: frame is on screen
         # ─────────────────────────────────────────────────────────────────────
         sock.sendto(header + b'\x02', ack_addr)
 
         frames_shown += 1
 
         # ─────────────────────────────────────────────────────────────────────
-        # STEP 14 — Print stats once per second
+        # STEP 13 — Print stats once per second
         # ─────────────────────────────────────────────────────────────────────
         now = time.perf_counter()
         if now - t_stats >= 1.0:
-            elapsed = now - t_stats
-            fps = frames_shown / elapsed
+            fps         = frames_shown / (now - t_stats)
             display_fps = fps
             print(f"FPS: {fps:.1f}  (dropped: {frames_dropped})")
             frames_shown   = 0
             frames_dropped = 0
-            t_stats = now
+            t_stats        = now
 
-        if key == ord('q') or key == ord('Q') or window_closed():
+        if pump_events():
             break
 
 except KeyboardInterrupt:
     print("\nExiting...")
 finally:
-    # STEP 15 — Cleanup
-    cv2.destroyAllWindows()
+    # STEP 14 — Cleanup
+    pygame.quit()
     sock.close()
