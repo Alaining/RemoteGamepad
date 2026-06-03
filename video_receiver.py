@@ -2,6 +2,7 @@
 # STEP 1 — Imports
 # ─────────────────────────────────────────────────────────────────────────────
 import socket
+import struct
 import sys
 import time
 import ctypes  # Win32 APIs: find/fix the OpenCV window cursor
@@ -96,6 +97,7 @@ frames_shown   = 0   # frames displayed this stats window
 frames_dropped = 0   # packets discarded by the drain loop this stats window
 t_stats = time.perf_counter()
 display_fps    = 0.0 # last computed FPS, drawn on each frame as an overlay
+display_e2e    = 0   # latest E2E latency (ms) received from sender header, drawn on each frame
 
 known_ack_addr    = None  # sender's (ip, ACK_PORT), learned from the first received frame
 last_frame_time   = time.perf_counter()  # time of the last successfully received frame
@@ -154,10 +156,11 @@ try:
         known_ack_addr = ack_addr
         last_frame_time = time.perf_counter()
 
-        if len(data) < 12:
+        if len(data) < 14:
             continue
-        header = data[:12]   # seq + timestamp, echoed back verbatim in every ACK
-        jpeg = data[12:]
+        header = data[:12]   # seq + timestamp only — echoed back verbatim in every ACK
+        display_e2e = struct.unpack(">H", data[12:14])[0]
+        jpeg = data[14:]
 
         # ─────────────────────────────────────────────────────────────────────
         # STEP 11 — ACK stage 0: frame received (before any processing)
@@ -177,9 +180,10 @@ try:
             win_h = r[3] if r[3] > 0 else DISPLAY_HEIGHT
             display = letterbox(frame, win_w, win_h)
             if display_fps > 0:
-                label = f"FPS {display_fps:.0f}"
-                cv2.rectangle(display, (5, 5), (105, 32), (0, 0, 0), -1)
-                cv2.putText(display, label, (10, 25),
+                cv2.rectangle(display, (5, 5), (130, 58), (0, 0, 0), -1)
+                cv2.putText(display, f"FPS {display_fps:.0f}", (10, 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+                cv2.putText(display, f"E2E {display_e2e}ms", (10, 50),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
             cv2.imshow("RemoteGamepad", display)
 

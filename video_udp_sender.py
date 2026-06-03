@@ -230,8 +230,9 @@ fps_frames = 0    # frames sent since the last stats print; reset every second
 t_prev_done = None  # timestamp after previous frame's ACK collection; next Encode is measured from here
 t_stats = time.perf_counter()
 t_fps_ref = time.perf_counter()
-t_last_send = None  # perf_counter timestamp of the most recently sent frame; used for RTT backpressure
-drop_count = 0      # frames skipped this second because send interval was shorter than 1/max_fps
+t_last_send = None   # perf_counter timestamp of the most recently sent frame; used for RTT backpressure
+drop_count = 0       # frames skipped this second because send interval was shorter than 1/max_fps
+_e2e_send_ms = 0.0  # latest E2E estimate (ms) embedded in every frame header for receiver overlay
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 11 — Outer loop: (re)start ffmpeg
@@ -328,7 +329,7 @@ try:
                 t_frame_ready = time.perf_counter_ns()
                 buf = buf[end + 2:]
 
-            if latest_frame and len(latest_frame) <= 65495:  # 65507 max UDP payload − 12B header = 65495 usable bytes
+            if latest_frame and len(latest_frame) <= 65493:  # 65507 max UDP payload − 14B header = 65493 usable bytes
                 _now_ns = time.perf_counter_ns()
                 if hwnd is not None and ctypes.windll.user32.GetForegroundWindow() != hwnd:
                     _hold_until_ns = _now_ns + 50_000_000  # extend 50ms blackout on every unfocused frame
@@ -352,9 +353,10 @@ try:
                     if t_enc_start is not None:
                         _enc.append((t_frame_ready - t_enc_start) / 1e6)  # pipe wait since last ACK-done
 
-                    # Header carries seq + sender timestamp_ns. The receiver echoes both verbatim
-                    # in every ACK so we can compute per-stage latencies using only the sender's clock.
-                    header = struct.pack(">IQ", seq & 0xFFFFFFFF, t_frame_ready)
+                    # Header: seq + timestamp_ns (echoed in ACKs) + e2e_ms for receiver overlay.
+                    # ACKs only echo the first 12 bytes (seq+timestamp); the 2-byte e2e field is display-only.
+                    header = struct.pack(">IQH", seq & 0xFFFFFFFF, t_frame_ready,
+                                         max(0, min(65535, int(_e2e_send_ms))))
                     t0 = time.perf_counter_ns()
                     sock.sendto(header + latest_frame, (ip, UDP_PORT))
                     t1 = time.perf_counter_ns()
@@ -434,6 +436,7 @@ try:
                         if _enc and _net and _dec:
                             e2e = sum(_enc)/len(_enc) + net_one_way + sum(_dec)/len(_dec)
                             e2e_str = f"{e2e:.1f}"
+                            _e2e_send_ms = e2e
                         else:
                             e2e_str = "---"
                         print(
