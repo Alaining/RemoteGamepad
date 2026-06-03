@@ -95,6 +95,7 @@ if _hwnd:
 frames_shown   = 0   # frames displayed this stats window
 frames_dropped = 0   # packets discarded by the drain loop this stats window
 t_stats = time.perf_counter()
+display_fps    = 0.0 # last computed FPS, drawn on each frame as an overlay
 
 known_ack_addr    = None  # sender's (ip, ACK_PORT), learned from the first received frame
 last_frame_time   = time.perf_counter()  # time of the last successfully received frame
@@ -174,7 +175,13 @@ try:
             r = cv2.getWindowImageRect("RemoteGamepad")
             win_w = r[2] if r[2] > 0 else DISPLAY_WIDTH
             win_h = r[3] if r[3] > 0 else DISPLAY_HEIGHT
-            cv2.imshow("RemoteGamepad", letterbox(frame, win_w, win_h))
+            display = letterbox(frame, win_w, win_h)
+            if display_fps > 0:
+                label = f"FPS {display_fps:.0f}"
+                cv2.rectangle(display, (5, 5), (105, 32), (0, 0, 0), -1)
+                cv2.putText(display, label, (10, 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+            cv2.imshow("RemoteGamepad", display)
 
         key = cv2.pollKey()  # pump the OpenCV event loop without sleeping (avoids vsync lock)
 
@@ -192,6 +199,7 @@ try:
         if now - t_stats >= 1.0:
             elapsed = now - t_stats
             fps = frames_shown / elapsed
+            display_fps = fps
             print(f"FPS: {fps:.1f}  (dropped: {frames_dropped})")
             frames_shown   = 0
             frames_dropped = 0
