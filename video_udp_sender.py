@@ -18,8 +18,8 @@ UDP_PORT = 5006
 ACK_PORT = 5007         # receiver sends latency ACKs back to this port
 ACK_TIMEOUT = 0.025     # seconds to wait per ACK stage; 25ms gives 6x headroom over the ~4ms LAN RTT
 FRAMERATE = 165         # capture and stream frame rate
-JPEG_QUALITY = 29       # 2=best/largest, 31=worst/smallest (ffmpeg -q:v scale)
-HEIGHT = 240            # stream height; width auto-scaled to maintain aspect ratio
+JPEG_QUALITY = 20       # 2=best/largest, 31=worst/smallest (ffmpeg -q:v scale)
+HEIGHT = 480            # stream height; width auto-scaled to maintain aspect ratio
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 3 — JPEG frame delimiters
@@ -407,9 +407,9 @@ try:
                     if 1 in t_stages and 2 in t_stages:
                         _drw.append((t_stages[2] - t_stages[1]) / 1e6)  # imshow + pollKey time on receiver
                     if 2 in t_stages:
-                        _rtt.append((t_stages[2] - t0) / 1e6)           # sendto → frame on screen
+                        _rtt.append((t_stages[2] - t0) / 1e6)
                         if t_enc_start is not None:
-                            _total.append((t_stages[2] - t_enc_start) / 1e6)  # true end-to-end viewer latency
+                            _total.append((t_stages[2] - t_enc_start) / 1e6)
 
                     t_prev_done = time.perf_counter_ns()  # mark end of this frame; next Encode is measured from here
                     seq += 1
@@ -428,12 +428,17 @@ try:
 
                         def a(d):
                             return f"{sum(d)/len(d):.1f}" if d else "---"
-                        net_est = f"{sum(_net)/len(_net)/2:.1f}" if _net else "---"
+                        net_one_way = sum(_net) / len(_net) / 2 if _net else None
+                        net_est = f"{net_one_way:.1f}" if net_one_way is not None else "---"
                         loss = f"{100*ack_miss/total_frames:.1f}" if total_frames else "0.0"
+                        if _enc and _net and _dec:
+                            e2e = sum(_enc)/len(_enc) + net_one_way + sum(_dec)/len(_dec)
+                            e2e_str = f"{e2e:.1f}"
+                        else:
+                            e2e_str = "---"
                         print(
-                            f"Total:{a(_total)}ms  "
-                            f"[Encode:{a(_enc)}ms  SendCall:{a(_snd)}ms  Net:{net_est}ms  "
-                            f"Decode:{a(_dec)}ms  Draw:{a(_drw)}ms  RTT:{a(_rtt)}ms]  "
+                            f"E2E:{e2e_str}ms  "
+                            f"[Encode:{a(_enc)}ms  Net:{net_est}ms  Decode:{a(_dec)}ms]  "
                             f"FPS:{fps:.1f}  Loss:{loss}%  Dropped:{drops_this_sec}/s"
                         )
 
