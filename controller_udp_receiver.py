@@ -14,6 +14,8 @@ sock.bind((UDP_IP, UDP_PORT))
 # Initialize vJoy device (Assuming ID 1)
 j = pyvjoy.VJoyDevice(1)
 
+sock.settimeout(1.0)
+
 print(f"Listening for UDP packets on {UDP_IP}:{UDP_PORT}...")
 
 def set_vjoy_buttons(buttons):
@@ -62,7 +64,10 @@ def set_vjoy_hat(dpads):
 try:
     while True:
         # Receive data
-        data, addr = sock.recvfrom(1024)  # Buffer size of 1024 bytes
+        try:
+            data, addr = sock.recvfrom(1024)  # Buffer size of 1024 bytes
+        except socket.timeout:
+            continue
         
         # Decode JSON data
         try:
