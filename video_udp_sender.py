@@ -18,8 +18,8 @@ UDP_PORT = 5006
 ACK_PORT = 5007         # receiver sends latency ACKs back to this port
 ACK_TIMEOUT = 0.025     # seconds to wait per ACK stage; 25ms gives 6x headroom over the ~4ms LAN RTT
 FRAMERATE = 165         # capture and stream frame rate
-JPEG_QUALITY = 25       # 2=best/largest, 31=worst/smallest (ffmpeg -q:v scale)
-HEIGHT = 360            # stream height; width auto-scaled to maintain aspect ratio
+JPEG_QUALITY = 22       # 2=best/largest, 31=worst/smallest (ffmpeg -q:v scale)
+HEIGHT = 480            # stream height; width auto-scaled to maintain aspect ratio
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 3 — JPEG frame delimiters

@@ -3,10 +3,15 @@ import socket
 import json
 import time
 import copy
+import sys
 
 # Prompt the user for the UDP_IP address
 print("IP controller by Alain")
-UDP_IP = input("Enter the receiver's IP address (example 203.0.113.2): ").strip()
+if len(sys.argv) > 1:
+    UDP_IP = sys.argv[1].strip()
+    print(f"Using IP from argument: {UDP_IP}")
+else:
+    UDP_IP = input("Enter the receiver's IP address (example 203.0.113.2): ").strip()
 if UDP_IP == "":
     UDP_IP = "127.0.0.1"
 UDP_PORT = 5005
