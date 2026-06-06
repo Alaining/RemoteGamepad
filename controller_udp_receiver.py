@@ -25,19 +25,24 @@ def set_vjoy_buttons(buttons):
 
 def set_vjoy_axes(axes):
     for axis, value in axes.items():
-        axis_value = int((value + 1) * 16383)  # Normalize to vJoy range (0-32767)
         if "axis_0" in axis:
-            j.set_axis(pyvjoy.HID_USAGE_Z, axis_value)
+            # L Stick X: right = X+
+            j.set_axis(pyvjoy.HID_USAGE_X, int((value + 1) * 16383))
         elif "axis_1" in axis:
-            j.set_axis(pyvjoy.HID_USAGE_X, axis_value)
+            # L Stick Y: up = Y-
+            j.set_axis(pyvjoy.HID_USAGE_Y, int((value + 1) * 16383))
         elif "axis_2" in axis:
-            j.set_axis(pyvjoy.HID_USAGE_Y, axis_value)
+            # R Stick X: right = X rotation+
+            j.set_axis(pyvjoy.HID_USAGE_RX, int((value + 1) * 16383))
         elif "axis_3" in axis:
-            j.set_axis(pyvjoy.HID_USAGE_RX, axis_value)
+            # R Stick Y: up = Y rotation-
+            j.set_axis(pyvjoy.HID_USAGE_RY, int((value + 1) * 16383))
         elif "axis_4" in axis:
-            j.set_axis(pyvjoy.HID_USAGE_RY, (int(axis_value/2)+16383))
+            # L Trigger: upper half of Z axis
+            j.set_axis(pyvjoy.HID_USAGE_Z, int((value + 1) * 8191) + 16383)
         elif "axis_5" in axis:
-            j.set_axis(pyvjoy.HID_USAGE_RZ, (int(axis_value/2)+16383))
+            # R Trigger: upper half of Z rotation
+            j.set_axis(pyvjoy.HID_USAGE_RZ, int((value + 1) * 8191) + 16383)
 
 def set_vjoy_hat(dpads):
     # Set the POV hat based on d-pad (hat) input
