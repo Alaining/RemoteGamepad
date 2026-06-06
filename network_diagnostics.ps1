@@ -26,6 +26,7 @@ param([string]$SenderIP, [string]$Machine)
 $CONTROLLER_PORT = 5005   # server binds (controller data from client)
 $VIDEO_PORT      = 5006   # client binds (video from server)
 $ACK_PORT        = 5007   # server binds (latency ACKs from client)
+$TIMEOUT_MS      = 60000  # 1 minute for all UDP connectivity tests
 
 # -- Issue flags --------------------------------------------------------------
 $pingIssue  = $false
@@ -43,57 +44,23 @@ function Write-WARN([string]$msg) { Write-Host "  [!]   $msg" -ForegroundColor Y
 function Write-FAIL([string]$msg) { Write-Host "  [X]   $msg" -ForegroundColor Red    }
 function Write-INFO([string]$msg) { Write-Host "        $msg" -ForegroundColor Gray   }
 
-# -- Async helpers ------------------------------------------------------------
-# Runs $block in a background runspace, printing dots every 500ms while it runs.
-# Does NOT print a trailing newline so the caller can append the result on the same line.
-# Returns the first object yielded by the scriptblock, or $null on error.
-function Invoke-WithDots([string]$msg, [scriptblock]$block, [object[]]$arguments = @()) {
+# -- Dot-printer helpers ------------------------------------------------------
+# System.Timers.Timer fires on a threadpool thread, so dots print even while
+# the main thread is blocked on a socket receive or a cmdlet call.
+function Start-Dots([string]$msg) {
     Write-Host -NoNewline "  $msg" -ForegroundColor Gray
-    $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
-    $rs.Open()
-    $ps = [System.Management.Automation.PowerShell]::Create()
-    $ps.Runspace = $rs
-    $ps.AddScript($block) | Out-Null
-    foreach ($a in $arguments) { $ps.AddArgument($a) | Out-Null }
-    $handle = $ps.BeginInvoke()
-    while (-not $handle.IsCompleted) {
-        Write-Host -NoNewline '.' -ForegroundColor Gray
-        Start-Sleep -Milliseconds 500
-    }
-    try { $col = $ps.EndInvoke($handle) } catch { $col = $null }
-    $rs.Close(); $ps.Dispose()
-    return $col
+    $t = [System.Timers.Timer]::new(500)
+    $t.AutoReset = $true
+    $t.add_Elapsed({ [Console]::Write('.') })
+    $t.Start()
+    return $t
 }
 
-# Starts a runspace immediately (without waiting) so the port/resource is
-# acquired early. Call Complete-AsyncTask later to collect the result with dots.
-function New-AsyncTask([scriptblock]$block, [object[]]$arguments = @()) {
-    $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
-    $rs.Open()
-    $ps = [System.Management.Automation.PowerShell]::Create()
-    $ps.Runspace = $rs
-    $ps.AddScript($block) | Out-Null
-    foreach ($a in $arguments) { $ps.AddArgument($a) | Out-Null }
-    return @{ PS = $ps; RS = $rs; Handle = $ps.BeginInvoke() }
-}
-
-# Waits for a task started with New-AsyncTask, printing dots until done.
-# Does NOT print a trailing newline.
-function Complete-AsyncTask($task, [string]$msg) {
-    Write-Host -NoNewline "  $msg" -ForegroundColor Gray
-    while (-not $task.Handle.IsCompleted) {
-        Write-Host -NoNewline '.' -ForegroundColor Gray
-        Start-Sleep -Milliseconds 500
-    }
-    try { $col = $task.PS.EndInvoke($task.Handle) } catch { $col = $null }
-    $task.RS.Close(); $task.PS.Dispose()
-    return $col
-}
-
-# Unwraps the first element from a runspace result collection.
-function Get-TaskResult($col, [hashtable]$fallback = @{ OK = $false }) {
-    if ($col -and $col.Count -gt 0) { return $col[0] }
-    return $fallback
+# Stop the dot printer. Does NOT print a newline so the caller can append
+# the result on the same line.
+function Stop-Dots($t) {
+    $t.Enabled = $false
+    $t.Dispose()
 }
 
 # -- Firewall helpers (only for optional rule creation in summary) ------------
@@ -130,13 +97,9 @@ function Invoke-CreateFirewallRule([int]$port, [string]$label) {
 }
 
 # -- 0. Collect other machine's IP --------------------------------------------
-if (-not $SenderIP) {
-    $SenderIP = (Read-Host "Enter the other machine's IP address").Trim()
-}
+if (-not $SenderIP) { $SenderIP = (Read-Host "Enter the other machine's IP address").Trim() }
 $SenderIP = $SenderIP.Trim()
-if ($SenderIP -notmatch '^\d{1,3}(\.\d{1,3}){3}$') {
-    Write-FAIL "Invalid IP address: '$SenderIP'"; exit 1
-}
+if ($SenderIP -notmatch '^\d{1,3}(\.\d{1,3}){3}$') { Write-FAIL "Invalid IP: '$SenderIP'"; exit 1 }
 
 # -- 0b. Machine role ---------------------------------------------------------
 if ($Machine -notmatch '^(CLIENT|SERVER)$') {
@@ -144,7 +107,7 @@ if ($Machine -notmatch '^(CLIENT|SERVER)$') {
     Write-Host "  Which machine is this?" -ForegroundColor White
     Write-Host "   [C] CLIENT  -- local PC         -- video_receiver.py + controller_udp_sender.py"
     Write-Host "   [S] SERVER  -- remote/gaming PC -- video_udp_sender.py + controller_udp_receiver.py"
-    $choice = Read-Host "  Choice"
+    $choice  = Read-Host "  Choice"
     $Machine = if ($choice -match '^[Ss]') { "SERVER" } else { "CLIENT" }
 }
 $Machine = $Machine.ToUpper()
@@ -168,13 +131,11 @@ if ($Machine -eq "CLIENT") {
 # =============================================================================
 Write-Section "1. Ping"
 
-$pingCol = Invoke-WithDots "Pinging $SenderIP (6 packets)" {
-    param($ip)
-    Test-Connection -ComputerName $ip -Count 6 -ErrorAction SilentlyContinue
-} @($SenderIP)
+$dt = Start-Dots "Pinging $SenderIP (6 packets)"
+$pings = Test-Connection -ComputerName $SenderIP -Count 6 -ErrorAction SilentlyContinue
+Stop-Dots $dt
 Write-Host ""
 
-$pings = $pingCol   # Collection[psobject] works like an array for ForEach / Measure-Object
 if (-not $pings -or $pings.Count -eq 0) {
     Write-FAIL "Ping failed -- host unreachable or ICMP blocked on the path"
     Write-INFO "  UDP may still work if only ICMP is blocked."
@@ -218,14 +179,13 @@ foreach ($addr in $localAddresses) {
 }
 
 $senderOctets = $SenderIP.Split(".")
-$onSameLAN = $false
+$onSameLAN    = $false
 foreach ($addr in $localAddresses) {
     $localOctets = $addr.IPAddress.Split(".")
     $sharedBytes = [Math]::Floor($addr.PrefixLength / 8)
     if ($sharedBytes -ge 2 -and
         ($localOctets[0..($sharedBytes-1)] -join ".") -eq ($senderOctets[0..($sharedBytes-1)] -join ".")) {
-        Write-OK "Other machine is on the same LAN subnet"
-        $onSameLAN = $true; break
+        Write-OK "Other machine is on the same LAN subnet"; $onSameLAN = $true; break
     }
 }
 if (-not $onSameLAN) {
@@ -248,8 +208,8 @@ foreach ($iface in $relevantIfaces) {
     $adapter = Get-NetAdapter -InterfaceIndex $iface.InterfaceIndex -ErrorAction SilentlyContinue
     if ($adapter -and $adapter.Status -eq "Up") {
         $mtu = $iface.NlMtu
-        if ($mtu -ge 9000)    { Write-OK   "[$($adapter.Name)] MTU = $mtu  (jumbo frames ENABLED)" }
-        elseif ($mtu -ge 1500){ Write-INFO "  [$($adapter.Name)] MTU = $mtu  (standard Ethernet)" }
+        if ($mtu -ge 9000)     { Write-OK   "[$($adapter.Name)] MTU = $mtu  (jumbo frames ENABLED)" }
+        elseif ($mtu -ge 1500) { Write-INFO "  [$($adapter.Name)] MTU = $mtu  (standard Ethernet)" }
     }
 }
 
@@ -257,8 +217,7 @@ Write-Host -NoNewline "  Testing path MTU" -ForegroundColor Gray
 $pmtuOk = $false
 foreach ($size in @(1472, 1400, 1000)) {
     Write-Host -NoNewline '.' -ForegroundColor Gray
-    $pingOut = ping.exe -n 1 -f -l $size $SenderIP
-    if ($pingOut -match "Reply from") { $pmtuOk = $true; break }
+    if (ping.exe -n 1 -f -l $size $SenderIP | Select-String "Reply from") { $pmtuOk = $true; break }
 }
 if ($pmtuOk) { Write-Host " OK  (>= $($size + 28) bytes)" -ForegroundColor Green }
 else         { Write-Host " low (< 1028 bytes)" -ForegroundColor Yellow; $mtuIssue = $true }
@@ -274,6 +233,7 @@ $PONG = [System.Text.Encoding]::ASCII.GetBytes("PONG")
 $result5005 = $false
 $result5006 = $false
 $result5007 = $false
+$clientIP   = $SenderIP   # best guess; overwritten on SERVER once first packet arrives
 
 if ($Machine -eq "SERVER") {
     $thisIP = if ($localAddresses) { $localAddresses[0].IPAddress } else { "?" }
@@ -282,125 +242,110 @@ if ($Machine -eq "SERVER") {
     Write-Host "      .\network_diagnostics.ps1 $thisIP CLIENT" -ForegroundColor White
     Write-Host ""
 
-    # Wait for 5005 probe from client
-    $col5005 = Invoke-WithDots "Waiting for client probe on UDP $CONTROLLER_PORT (2 min timeout)" {
-        param($port, $pong)
-        $s = New-Object System.Net.Sockets.UdpClient
-        try { $s.Client.Bind([System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, $port)) }
-        catch { return @{ OK = $false; Error = "bind_failed" } }
-        $s.Client.ReceiveTimeout = 120000
+    # Bind to 5005 and 5007 before printing anything so the kernel can buffer
+    # packets that arrive while we are still printing the first wait line.
+    $sock5005 = $null
+    try {
+        $sock5005 = New-Object System.Net.Sockets.UdpClient
+        $sock5005.Client.Bind([System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, $CONTROLLER_PORT))
+        $sock5005.Client.ReceiveTimeout = $TIMEOUT_MS
+    } catch { Write-WARN "Cannot bind UDP $CONTROLLER_PORT -- controller_udp_receiver.py may be running" }
+
+    $sock5007 = $null
+    try {
+        $sock5007 = New-Object System.Net.Sockets.UdpClient
+        $sock5007.Client.Bind([System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, $ACK_PORT))
+        $sock5007.Client.ReceiveTimeout = $TIMEOUT_MS
+    } catch { Write-WARN "Cannot bind UDP $ACK_PORT -- port may already be in use" }
+
+    # Wait for 5005
+    if ($sock5005) {
+        $dt = Start-Dots "Waiting for client probe on UDP $CONTROLLER_PORT (1 min)"
         $ep = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
         try {
-            $null = $s.Receive([ref]$ep)
-            $s.Send($pong, $pong.Length, $ep) | Out-Null
-            @{ OK = $true; IP = $ep.Address.ToString() }
-        } catch { @{ OK = $false; Error = "timeout" } }
-        finally { $s.Close() }
-    } @($CONTROLLER_PORT, $PONG)
-    $r5005 = Get-TaskResult $col5005
-    if     ($r5005.OK)                    { Write-Host " [OK]  probe from $($r5005.IP)" -ForegroundColor Green; $result5005 = $true; $clientIP = $r5005.IP }
-    elseif ($r5005.Error -eq "bind_failed"){ Write-Host " port busy (controller_udp_receiver.py running?)" -ForegroundColor Yellow }
-    else                                  { Write-Host " [TIMEOUT]" -ForegroundColor Red }
+            $null = $sock5005.Receive([ref]$ep)
+            $clientIP = $ep.Address.ToString()
+            $sock5005.Send($PONG, $PONG.Length, $ep) | Out-Null
+            Stop-Dots $dt; Write-Host " [OK]  probe from $clientIP" -ForegroundColor Green
+            $result5005 = $true
+        } catch { Stop-Dots $dt; Write-Host " [TIMEOUT]" -ForegroundColor Red }
+        $sock5005.Close()
+    }
 
-    $clientIP = if ($clientIP) { $clientIP } else { $SenderIP }
-
-    # Wait for 5007 probe from client
-    $col5007 = Invoke-WithDots "Waiting for client probe on UDP $ACK_PORT (30s timeout)" {
-        param($port, $pong)
-        $s = New-Object System.Net.Sockets.UdpClient
-        try { $s.Client.Bind([System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, $port)) }
-        catch { return @{ OK = $false; Error = "bind_failed" } }
-        $s.Client.ReceiveTimeout = 30000
+    # Wait for 5007
+    if ($sock5007) {
+        $dt = Start-Dots "Waiting for client probe on UDP $ACK_PORT (1 min)"
         $ep = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
         try {
-            $null = $s.Receive([ref]$ep)
-            $s.Send($pong, $pong.Length, $ep) | Out-Null
-            @{ OK = $true }
-        } catch { @{ OK = $false; Error = "timeout" } }
-        finally { $s.Close() }
-    } @($ACK_PORT, $PONG)
-    $r5007 = Get-TaskResult $col5007
-    if     ($r5007.OK)                     { Write-Host " [OK]" -ForegroundColor Green; $result5007 = $true }
-    elseif ($r5007.Error -eq "bind_failed") { Write-Host " port busy" -ForegroundColor Yellow }
-    else                                   { Write-Host " [TIMEOUT]" -ForegroundColor Red }
+            $null = $sock5007.Receive([ref]$ep)
+            $sock5007.Send($PONG, $PONG.Length, $ep) | Out-Null
+            Stop-Dots $dt; Write-Host " [OK]" -ForegroundColor Green
+            $result5007 = $true
+        } catch { Stop-Dots $dt; Write-Host " [TIMEOUT]" -ForegroundColor Red }
+        $sock5007.Close()
+    }
 
     # Probe client's 5006
-    $col5006 = Invoke-WithDots "Probing client UDP $VIDEO_PORT at $clientIP (15s timeout)" {
-        param($ip, $port, $diag)
-        $s = New-Object System.Net.Sockets.UdpClient
-        $s.Client.ReceiveTimeout = 15000
-        try {
-            $s.Send($diag, $diag.Length, $ip, $port) | Out-Null
-            $ep = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
-            $null = $s.Receive([ref]$ep)
-            @{ OK = $true; IP = $ep.Address.ToString() }
-        } catch { @{ OK = $false } }
-        finally { $s.Close() }
-    } @($clientIP, $VIDEO_PORT, $DIAG)
-    $r5006 = Get-TaskResult $col5006
-    if ($r5006.OK) { Write-Host " [OK]  client replied" -ForegroundColor Green; $result5006 = $true }
-    else           { Write-Host " [TIMEOUT]" -ForegroundColor Red }
+    $dt   = Start-Dots "Probing client UDP $VIDEO_PORT at $clientIP (1 min)"
+    $sock = New-Object System.Net.Sockets.UdpClient
+    $sock.Client.ReceiveTimeout = $TIMEOUT_MS
+    $ep   = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
+    try {
+        $sock.Send($DIAG, $DIAG.Length, $clientIP, $VIDEO_PORT) | Out-Null
+        $null = $sock.Receive([ref]$ep)
+        Stop-Dots $dt; Write-Host " [OK]  client replied" -ForegroundColor Green
+        $result5006 = $true
+    } catch { Stop-Dots $dt; Write-Host " [TIMEOUT]" -ForegroundColor Red }
+    $sock.Close()
 
 } else {
-    # CLIENT
-    Write-INFO "  Binding to UDP $VIDEO_PORT first, then probing server..."
-
-    # Start 5006 listener BEFORE probing server so port is bound when server probes us back
-    $task5006 = New-AsyncTask {
-        param($port, $pong)
-        $s = New-Object System.Net.Sockets.UdpClient
-        try { $s.Client.Bind([System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, $port)) }
-        catch { return @{ OK = $false; Error = "bind_failed" } }
-        $s.Client.ReceiveTimeout = 30000
-        $ep = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
-        try {
-            $null = $s.Receive([ref]$ep)
-            $s.Send($pong, $pong.Length, $ep) | Out-Null
-            @{ OK = $true; IP = $ep.Address.ToString() }
-        } catch { @{ OK = $false; Error = "timeout" } }
-        finally { $s.Close() }
-    } @($VIDEO_PORT, $PONG)
+    # CLIENT -- bind to 5006 first so the kernel buffers any probe that arrives
+    # while we are still running the 5005 / 5007 steps.
+    $sock5006 = $null
+    try {
+        $sock5006 = New-Object System.Net.Sockets.UdpClient
+        $sock5006.Client.Bind([System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, $VIDEO_PORT))
+        $sock5006.Client.ReceiveTimeout = $TIMEOUT_MS
+    } catch { Write-WARN "Cannot bind UDP $VIDEO_PORT -- video_receiver.py may already be running" }
 
     # Probe server:5005
-    $col5005 = Invoke-WithDots "Probing server UDP $CONTROLLER_PORT at $SenderIP (10s timeout)" {
-        param($ip, $port, $diag)
-        $s = New-Object System.Net.Sockets.UdpClient
-        $s.Client.ReceiveTimeout = 10000
-        try {
-            $s.Send($diag, $diag.Length, $ip, $port) | Out-Null
-            $ep = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
-            $null = $s.Receive([ref]$ep)
-            @{ OK = $true; IP = $ep.Address.ToString() }
-        } catch { @{ OK = $false } }
-        finally { $s.Close() }
-    } @($SenderIP, $CONTROLLER_PORT, $DIAG)
-    $r5005 = Get-TaskResult $col5005
-    if ($r5005.OK) { Write-Host " [OK]  server $($r5005.IP) replied" -ForegroundColor Green; $result5005 = $true }
-    else           { Write-Host " [TIMEOUT]" -ForegroundColor Red }
+    $dt   = Start-Dots "Probing server UDP $CONTROLLER_PORT at $SenderIP (1 min)"
+    $sock = New-Object System.Net.Sockets.UdpClient
+    $sock.Client.ReceiveTimeout = $TIMEOUT_MS
+    $ep   = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
+    try {
+        $sock.Send($DIAG, $DIAG.Length, $SenderIP, $CONTROLLER_PORT) | Out-Null
+        $null = $sock.Receive([ref]$ep)
+        Stop-Dots $dt; Write-Host " [OK]  server $($ep.Address) replied" -ForegroundColor Green
+        $result5005 = $true
+    } catch { Stop-Dots $dt; Write-Host " [TIMEOUT]" -ForegroundColor Red }
+    $sock.Close()
 
     # Probe server:5007
-    $col5007 = Invoke-WithDots "Probing server UDP $ACK_PORT at $SenderIP (10s timeout)" {
-        param($ip, $port, $diag)
-        $s = New-Object System.Net.Sockets.UdpClient
-        $s.Client.ReceiveTimeout = 10000
-        try {
-            $s.Send($diag, $diag.Length, $ip, $port) | Out-Null
-            $ep = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
-            $null = $s.Receive([ref]$ep)
-            @{ OK = $true; IP = $ep.Address.ToString() }
-        } catch { @{ OK = $false } }
-        finally { $s.Close() }
-    } @($SenderIP, $ACK_PORT, $DIAG)
-    $r5007 = Get-TaskResult $col5007
-    if ($r5007.OK) { Write-Host " [OK]  server $($r5007.IP) replied" -ForegroundColor Green; $result5007 = $true }
-    else           { Write-Host " [TIMEOUT]" -ForegroundColor Red }
+    $dt   = Start-Dots "Probing server UDP $ACK_PORT at $SenderIP (1 min)"
+    $sock = New-Object System.Net.Sockets.UdpClient
+    $sock.Client.ReceiveTimeout = $TIMEOUT_MS
+    $ep   = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
+    try {
+        $sock.Send($DIAG, $DIAG.Length, $SenderIP, $ACK_PORT) | Out-Null
+        $null = $sock.Receive([ref]$ep)
+        Stop-Dots $dt; Write-Host " [OK]  server $($ep.Address) replied" -ForegroundColor Green
+        $result5007 = $true
+    } catch { Stop-Dots $dt; Write-Host " [TIMEOUT]" -ForegroundColor Red }
+    $sock.Close()
 
-    # Collect 5006 result (task was already running)
-    $col5006 = Complete-AsyncTask $task5006 "Waiting for server probe on UDP $VIDEO_PORT (30s timeout)"
-    $r5006 = Get-TaskResult $col5006
-    if     ($r5006.OK)                     { Write-Host " [OK]  probe from $($r5006.IP)" -ForegroundColor Green; $result5006 = $true }
-    elseif ($r5006.Error -eq "bind_failed") { Write-Host " port busy (video_receiver.py running?)" -ForegroundColor Yellow }
-    else                                   { Write-Host " [TIMEOUT]" -ForegroundColor Red }
+    # Wait for server probe on 5006
+    if ($sock5006) {
+        $dt = Start-Dots "Waiting for server probe on UDP $VIDEO_PORT (1 min)"
+        $ep = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
+        try {
+            $null = $sock5006.Receive([ref]$ep)
+            $sock5006.Send($PONG, $PONG.Length, $ep) | Out-Null
+            Stop-Dots $dt; Write-Host " [OK]  probe from $($ep.Address)" -ForegroundColor Green
+            $result5006 = $true
+        } catch { Stop-Dots $dt; Write-Host " [TIMEOUT]" -ForegroundColor Red }
+        $sock5006.Close()
+    }
 }
 
 # =============================================================================
@@ -417,7 +362,7 @@ function Test-PortBound([int]$port, [string]$scriptName, [bool]$shouldBind) {
         else             { Write-WARN "UDP $port -- already bound locally (another app may interfere)" }
     } else {
         if ($shouldBind) {
-            try { $sock = New-Object System.Net.Sockets.UdpClient($port); $sock.Close()
+            try { $s = New-Object System.Net.Sockets.UdpClient($port); $s.Close()
                   Write-INFO "  UDP $port -- not bound; ready for $scriptName to use"
             } catch { Write-WARN "UDP $port -- bind failed: port already in use" }
         } else { Write-INFO "  UDP $port -- not bound locally (correct -- outbound only)" }
@@ -439,14 +384,12 @@ if ($Machine -eq "CLIENT") {
 # =============================================================================
 Write-Section "6. Route to Other Machine (up to 10 hops)"
 
-$traceCol = Invoke-WithDots "Tracing route to $SenderIP" {
-    param($ip)
-    try { Test-NetConnection -ComputerName $ip -TraceRoute -Hops 10 -WarningAction SilentlyContinue -ErrorAction Stop }
-    catch { $null }
-} @($SenderIP)
+$dt    = Start-Dots "Tracing route to $SenderIP"
+$trace = $null
+try { $trace = Test-NetConnection -ComputerName $SenderIP -TraceRoute -Hops 10 -WarningAction SilentlyContinue -ErrorAction Stop } catch {}
+Stop-Dots $dt
 Write-Host ""
 
-$trace = if ($traceCol) { $traceCol[0] } else { $null }
 if ($trace) {
     $hops = $trace.TraceRoute | Where-Object { $_ -ne "0.0.0.0" -and $_ -ne "::" }
     if ($hops) {
@@ -481,10 +424,8 @@ if ($Machine -eq "CLIENT") {
         if ((Read-Host "  Choice") -match "^[Yy]") { Invoke-CreateFirewallRule -port $VIDEO_PORT -label "Video Stream" }
     }
     if (-not $result5005 -or -not $result5007) {
-        $failedServer = @()
-        if (-not $result5005) { $failedServer += "UDP $CONTROLLER_PORT" }
-        if (-not $result5007) { $failedServer += "UDP $ACK_PORT" }
-        Write-WARN "$($failedServer -join " and ") did not pass -- the SERVER may need inbound rules for those ports."
+        $fs = @(); if (-not $result5005) { $fs += "UDP $CONTROLLER_PORT" }; if (-not $result5007) { $fs += "UDP $ACK_PORT" }
+        Write-WARN "$($fs -join " and ") did not pass -- the SERVER may need inbound rules for those ports."
     }
     if ($result5005 -and $result5006 -and $result5007) { Write-OK "All three ports passed end-to-end." }
 } else {
@@ -505,12 +446,11 @@ if ($Machine -eq "CLIENT") {
         Write-Host "  Create inbound allow rules for the failed ports on this machine? [Y/N]" -ForegroundColor Yellow
         if ((Read-Host "  Choice") -match "^[Yy]") {
             foreach ($p in $failedLocal) {
-                $lbl = if ($p -eq $CONTROLLER_PORT) { "Controller Data" } else { "Latency ACKs" }
-                Invoke-CreateFirewallRule -port $p -label $lbl
+                Invoke-CreateFirewallRule -port $p -label (if ($p -eq $CONTROLLER_PORT) { "Controller Data" } else { "Latency ACKs" })
             }
         }
     }
-    if (-not $result5006) { Write-WARN "UDP $VIDEO_PORT (video) did not reach the client -- the CLIENT may need an inbound rule." }
+    if (-not $result5006) { Write-WARN "UDP $VIDEO_PORT (video) did not reach client -- the CLIENT may need an inbound rule." }
     if ($result5005 -and $result5006 -and $result5007) { Write-OK "All three ports passed end-to-end." }
 }
 
@@ -518,9 +458,7 @@ $tips = @()
 if ($pingIssue -or $routeIssue) { $tips += "High latency / many hops  -> prefer wired Ethernet or same LAN" }
 if ($mtuIssue)                  { $tips += "MTU issues -> run setup_jumbo_frames.ps1 on both machines (LAN only)" }
 if ($tips.Count -gt 0) {
-    Write-Host ""
-    Write-Host "  Tips:" -ForegroundColor White
+    Write-Host ""; Write-Host "  Tips:" -ForegroundColor White
     foreach ($tip in $tips) { Write-Host "    * $tip" }
 }
-
 Write-Host ""
