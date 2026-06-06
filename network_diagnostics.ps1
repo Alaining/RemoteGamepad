@@ -1,18 +1,18 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Network diagnostics for RemoteGamepad -- run on the RECEIVER machine.
+    Network diagnostics for RemoteGamepad -- run on the CLIENT machine.
 .DESCRIPTION
     Machine roles:
-      RECEIVER  -- your local PC  -- runs video_receiver.py + controller_udp_sender.py
-      SENDER    -- remote/gaming PC -- runs video_udp_sender.py + controller_udp_receiver.py
+      CLIENT  -- your local PC  -- runs video_receiver.py + controller_udp_sender.py
+      SERVER  -- remote/gaming PC -- runs video_udp_sender.py + controller_udp_receiver.py
 
-    Port layout from the RECEIVER's perspective:
-      5005/UDP  controller data  -- RECEIVER sends OUT to sender  (no inbound rule needed here)
-      5006/UDP  video frames     -- RECEIVER listens IN from sender (inbound rule required here)
-      5007/UDP  latency ACKs     -- RECEIVER sends OUT to sender  (no inbound rule needed here)
+    Port layout from the CLIENT's perspective:
+      5005/UDP  controller data  -- CLIENT sends OUT to server  (no inbound rule needed here)
+      5006/UDP  video frames     -- CLIENT listens IN from server (inbound rule required here)
+      5007/UDP  latency ACKs     -- CLIENT sends OUT to server  (no inbound rule needed here)
 .PARAMETER SenderIP
-    IP address of the sender machine. If omitted, you will be prompted.
+    IP address of the server machine. If omitted, you will be prompted.
 .EXAMPLE
     .\network_diagnostics.ps1
     .\network_diagnostics.ps1 192.168.1.50
@@ -21,9 +21,9 @@
 param([string]$SenderIP)
 
 # -- Ports --------------------------------------------------------------------
-$CONTROLLER_PORT = 5005   # receiver sends OUT to sender (sender binds this)
-$VIDEO_PORT      = 5006   # receiver binds IN (video from sender)
-$ACK_PORT        = 5007   # receiver sends OUT to sender (sender binds this)
+$CONTROLLER_PORT = 5005   # client sends OUT to server (server binds this)
+$VIDEO_PORT      = 5006   # client binds IN (video from server)
+$ACK_PORT        = 5007   # client sends OUT to server (server binds this)
 
 # -- Console helpers ----------------------------------------------------------
 function Write-Section([string]$title) {
@@ -36,9 +36,9 @@ function Write-WARN([string]$msg) { Write-Host "  [!]   $msg" -ForegroundColor Y
 function Write-FAIL([string]$msg) { Write-Host "  [X]   $msg" -ForegroundColor Red    }
 function Write-INFO([string]$msg) { Write-Host "        $msg" -ForegroundColor Gray   }
 
-# -- 0. Collect sender IP -----------------------------------------------------
+# -- 0. Collect server IP -----------------------------------------------------
 if (-not $SenderIP) {
-    $SenderIP = (Read-Host "Enter the SENDER machine's IP address").Trim()
+    $SenderIP = (Read-Host "Enter the SERVER's IP address").Trim()
 }
 $SenderIP = $SenderIP.Trim()
 
@@ -48,10 +48,10 @@ if ($SenderIP -notmatch '^\d{1,3}(\.\d{1,3}){3}$') {
 }
 
 Write-Host ""
-Write-Host " RemoteGamepad -- Network Diagnostics (RECEIVER side) " -ForegroundColor White -BackgroundColor DarkBlue
-Write-Host "  Sender IP : $SenderIP"
-Write-Host "  This machine (RECEIVER) : video_receiver.py + controller_udp_sender.py"
-Write-Host "  Sender machine          : video_udp_sender.py + controller_udp_receiver.py"
+Write-Host " RemoteGamepad -- Network Diagnostics (CLIENT side) " -ForegroundColor White -BackgroundColor DarkBlue
+Write-Host "  Server IP : $SenderIP"
+Write-Host "  This machine (CLIENT) : video_receiver.py + controller_udp_sender.py"
+Write-Host "  Server machine        : video_udp_sender.py + controller_udp_receiver.py"
 
 # -----------------------------------------------------------------------------
 # 1. PING
@@ -104,14 +104,14 @@ foreach ($addr in $localAddresses) {
     $sharedBytes = [Math]::Floor($maskBits / 8)
     if ($sharedBytes -ge 2 -and
         ($localOctets[0..($sharedBytes-1)] -join ".") -eq ($senderOctets[0..($sharedBytes-1)] -join ".")) {
-        Write-OK "Sender appears to be on the same LAN subnet ($($addr.IPAddress)/$maskBits)"
+        Write-OK "Server appears to be on the same LAN subnet ($($addr.IPAddress)/$maskBits)"
         $onSameLAN = $true
         break
     }
 }
 if (-not $onSameLAN) {
-    Write-WARN "Sender appears to be on a different subnet -- NAT/routing will be involved"
-    Write-INFO "  Make sure port forwarding is configured on the sender's router for UDP 5005 and 5007."
+    Write-WARN "Server appears to be on a different subnet -- NAT/routing will be involved"
+    Write-INFO "  Make sure port forwarding is configured on the server's router for UDP 5005 and 5007."
 }
 
 # -----------------------------------------------------------------------------
@@ -139,7 +139,7 @@ Write-INFO "  Max usable UDP payload : $udpMax bytes"
 Write-INFO "  MJPEG frames at 480p are typically 10-50 KB -- well within the limit"
 
 # Test path MTU using ping with Don't-Fragment bit
-Write-INFO "  Testing path MTU to sender (DF-bit ping)..."
+Write-INFO "  Testing path MTU to server (DF-bit ping)..."
 $pmtuOk = $false
 foreach ($size in @(1472, 1400, 1000)) {
     # -f sets DF bit; -l sets payload size
@@ -155,7 +155,7 @@ if (-not $pmtuOk) {
 }
 
 # -----------------------------------------------------------------------------
-# 4. WINDOWS FIREWALL -- INBOUND RULES (RECEIVER side)
+# 4. WINDOWS FIREWALL -- INBOUND RULES (CLIENT side)
 # -----------------------------------------------------------------------------
 Write-Section "4. Windows Firewall -- Inbound Rules"
 
@@ -189,7 +189,7 @@ if ($video5006Rule) {
 } else {
     Write-Host "[MISSING]" -ForegroundColor Red
 }
-Write-INFO "  UDP $CONTROLLER_PORT and $ACK_PORT are outbound -- inbound rules needed on the SENDER, not here."
+Write-INFO "  UDP $CONTROLLER_PORT and $ACK_PORT are outbound -- inbound rules needed on the SERVER, not here."
 
 # -----------------------------------------------------------------------------
 # 5. PORT AVAILABILITY -- IS ANYTHING ALREADY BOUND?
@@ -198,7 +198,7 @@ Write-Section "5. Port Availability (is anything already listening?)"
 
 $netstatOutput = netstat -an -p UDP
 
-# UDP 5006 is the only port the receiver binds
+# UDP 5006 is the only port the client binds
 $bound = $netstatOutput | Select-String "[\s:]$VIDEO_PORT\s"
 if ($bound) {
     Write-OK "UDP $VIDEO_PORT -- already bound (video_receiver.py may be running)"
@@ -218,14 +218,14 @@ foreach ($port in @($CONTROLLER_PORT, $ACK_PORT)) {
     if ($abound) {
         Write-WARN "UDP $port -- already bound locally (another app may interfere with outbound traffic)"
     } else {
-        Write-INFO "  UDP $port -- not bound locally (correct -- this machine sends to sender:$port, never binds it)"
+        Write-INFO "  UDP $port -- not bound locally (correct -- this machine sends to server:$port, never binds it)"
     }
 }
 
 # -----------------------------------------------------------------------------
 # 6. ROUTE TRACE
 # -----------------------------------------------------------------------------
-Write-Section "6. Route to Sender (up to 10 hops)"
+Write-Section "6. Route to Server (up to 10 hops)"
 
 try {
     $trace = Test-NetConnection -ComputerName $SenderIP -TraceRoute -Hops 10 `
@@ -251,23 +251,23 @@ try {
 # -----------------------------------------------------------------------------
 Write-Section "7. Summary"
 Write-Host ""
-Write-Host "  Port layout (RECEIVER perspective):" -ForegroundColor White
+Write-Host "  Port layout (CLIENT perspective):" -ForegroundColor White
 
-# 5005 -- outbound, rule needed on sender
-Write-Host "    5005/UDP  Controller data  RECEIVER sends --> sender  " -NoNewline
-Write-Host "[rule needed on SENDER]" -ForegroundColor Yellow
+# 5005 -- outbound, rule needed on server
+Write-Host "    5005/UDP  Controller data  CLIENT sends --> server  " -NoNewline
+Write-Host "[rule needed on SERVER]" -ForegroundColor Yellow
 
 # 5006 -- inbound, check live status
-Write-Host "    5006/UDP  Video frames     RECEIVER listens <-- sender " -NoNewline
+Write-Host "    5006/UDP  Video frames     CLIENT listens <-- server " -NoNewline
 if ($video5006Rule) {
     Write-Host "[OK]  $video5006Rule" -ForegroundColor Green
 } else {
     Write-Host "[MISSING]" -ForegroundColor Red
 }
 
-# 5007 -- outbound, rule needed on sender
-Write-Host "    5007/UDP  Latency ACKs     RECEIVER sends --> sender  " -NoNewline
-Write-Host "[rule needed on SENDER]" -ForegroundColor Yellow
+# 5007 -- outbound, rule needed on server
+Write-Host "    5007/UDP  Latency ACKs     CLIENT sends --> server  " -NoNewline
+Write-Host "[rule needed on SERVER]" -ForegroundColor Yellow
 
 Write-Host ""
 
@@ -309,7 +309,7 @@ if (-not $video5006Rule) {
 
 Write-Host ""
 Write-Host "  Other tips:" -ForegroundColor White
-Write-Host "    * Rules for 5005 and 5007        -> run this script on the SENDER machine"
+Write-Host "    * Rules for 5005 and 5007        -> run this script on the SERVER machine"
 Write-Host "    * High latency / many hops       -> prefer wired Ethernet or same LAN"
 Write-Host "    * MTU issues                     -> run setup_jumbo_frames.ps1 on both machines (LAN only)"
 Write-Host "    * Bind failure on 5006           -> stop any running video_receiver.py first"

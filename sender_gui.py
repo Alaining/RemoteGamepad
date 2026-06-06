@@ -17,7 +17,7 @@ def apply_deadzone(value, deadzone):
 def start_remote_gamepad(user_input):
     # Prompt the user for the UDP_IP address
     # print("IP controller by Alain")
-    # UDP_IP = input("Enter the receiver's IP address (example 203.0.113.2): ").strip()
+    # UDP_IP = input("Enter the server's IP address (example 203.0.113.2): ").strip()
     UDP_IP = user_input
     if UDP_IP == "":
         UDP_IP = "127.0.0.1"

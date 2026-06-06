@@ -15,7 +15,7 @@ from collections import deque  # fixed-length rolling buffer for latency statist
 # STEP 2 — Tunable constants
 # ─────────────────────────────────────────────────────────────────────────────
 UDP_PORT = 5006
-ACK_PORT = 5007         # receiver sends latency ACKs back to this port
+ACK_PORT = 5007         # client sends latency ACKs back to this port
 ACK_TIMEOUT = 0.025     # seconds to wait per ACK stage; 25ms gives 6x headroom over the ~4ms LAN RTT
 FRAMERATE = 165         # capture and stream frame rate
 JPEG_QUALITY = 20       # 2=best/largest, 31=worst/smallest (ffmpeg -q:v scale)
@@ -30,7 +30,7 @@ SOI = b'\xff\xd8'  # start-of-image: every JPEG begins with these 2 bytes
 EOI = b'\xff\xd9'  # end-of-image:   every JPEG ends   with these 2 bytes
 
 # Frame packet layout: [seq: 4B big-endian uint][timestamp_ns: 8B big-endian int64][JPEG data]
-# ACK packet layout:   [seq: 4B][timestamp_ns: 8B][stage: 1B]  (receiver echoes header + stage)
+# ACK packet layout:   [seq: 4B][timestamp_ns: 8B][stage: 1B]  (client echoes header + stage)
 # ACK stages: 0=frame received, 1=decoded (imdecode done), 2=drawn (imshow+pollKey done)
 
 
@@ -172,12 +172,12 @@ def pick_capture_target():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 8 — Startup: get receiver IP and capture source from the user
+# STEP 8 — Startup: get client IP and capture source from the user
 # ─────────────────────────────────────────────────────────────────────────────
 if len(sys.argv) > 1:
     ip = sys.argv[1].strip()
 else:
-    ip = input("Enter the receiver's IP address: ").strip()
+    ip = input("Enter the client's IP address: ").strip()
 if ip == "":
     ip = "127.0.0.1"
 
@@ -198,7 +198,7 @@ else:
     label = f"window '{title}'"
 
 print(f"\nStreaming {label} to {ip}:{UDP_PORT} at {HEIGHT}p {FRAMERATE}fps (MJPEG q={JPEG_QUALITY})")
-print("Run video_receiver.py on the receiver to watch.\n")
+print("Run video_receiver.py on the client to watch.\n")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 9 — Socket setup
@@ -219,8 +219,8 @@ WINDOW = 60  # number of recent frames kept in each rolling latency average
 _enc   = deque(maxlen=WINDOW)  # time from previous ACK-done to this frame ready in the pipe (encode + pipe wait)
 _snd   = deque(maxlen=WINDOW)  # duration of the sendto() syscall
 _net   = deque(maxlen=WINDOW)  # (stage-0 RTT) ÷ 2 ≈ one-way network latency
-_dec   = deque(maxlen=WINDOW)  # stage-1 minus stage-0: imdecode time on the receiver
-_drw   = deque(maxlen=WINDOW)  # stage-2 minus stage-1: imshow + pollKey time on the receiver
+_dec   = deque(maxlen=WINDOW)  # stage-1 minus stage-0: imdecode time on the client
+_drw   = deque(maxlen=WINDOW)  # stage-2 minus stage-1: imshow + pollKey time on the client
 _rtt   = deque(maxlen=WINDOW)  # sendto to stage-2: round-trip until the frame is on screen
 _total = deque(maxlen=WINDOW)  # previous ACK-done to stage-2: true end-to-end viewer latency
 _fsz   = deque(maxlen=WINDOW)  # JPEG frame size in bytes; reveals IP fragmentation pressure
@@ -233,7 +233,7 @@ t_stats = time.perf_counter()
 t_fps_ref = time.perf_counter()
 t_last_send = None   # perf_counter timestamp of the most recently sent frame; used for RTT backpressure
 drop_count = 0       # frames skipped this second because send interval was shorter than 1/max_fps
-_e2e_send_ms = 0.0  # latest E2E estimate (ms) embedded in every frame header for receiver overlay
+_e2e_send_ms = 0.0  # latest E2E estimate (ms) embedded in every frame header for client overlay
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 11 — Outer loop: (re)start ffmpeg
@@ -341,7 +341,7 @@ try:
 
                 # Drop this frame if we're sending faster than 70% of 1/RTT.
                 # Use _net (stage-0 network RTT) rather than _rtt (end-to-end including imshow)
-                # so that receiver display slowdowns don't incorrectly throttle the send rate.
+                # so that client display slowdowns don't incorrectly throttle the send rate.
                 if _net and t_last_send is not None:
                     avg_net_rtt_ms = sum(_net) / len(_net)
                     if time.perf_counter() - t_last_send < avg_net_rtt_ms / 700.0:
@@ -354,7 +354,7 @@ try:
                     if t_enc_start is not None:
                         _enc.append((t_frame_ready - t_enc_start) / 1e6)  # pipe wait since last ACK-done
 
-                    # Header: seq + timestamp_ns (echoed in ACKs) + e2e_ms for receiver overlay.
+                    # Header: seq + timestamp_ns (echoed in ACKs) + e2e_ms for client overlay.
                     # ACKs only echo the first 12 bytes (seq+timestamp); the 2-byte e2e field is display-only.
                     header = struct.pack(">IQH", seq & 0xFFFFFFFF, t_frame_ready,
                                          max(0, min(65535, int(_e2e_send_ms))))
@@ -378,8 +378,8 @@ try:
                     ack_sock.settimeout(ACK_TIMEOUT)
 
                     # Collect stage 0 (received) and 1 (decoded) with timeout — these are fast (~4ms, ~6ms).
-                    # Stage 2 (imshow done) is NOT awaited: cv2.imshow on the receiver can stall 30-100ms
-                    # when the Windows compositor is slow, which would freeze the sender for that entire time.
+                    # Stage 2 (imshow done) is NOT awaited: cv2.imshow on the client can stall 30-100ms
+                    # when the Windows compositor is slow, which would freeze the server for that entire time.
                     # Instead we do one non-blocking peek after stage 1 to capture stage 2 for stats when
                     # it has already arrived, without ever blocking on it.
                     t_stages = {}
@@ -407,9 +407,9 @@ try:
                     if 0 in t_stages:
                         _net.append((t_stages[0] - t0) / 1e6)           # stage-0 RTT ÷ 2 ≈ one-way network
                     if 0 in t_stages and 1 in t_stages:
-                        _dec.append((t_stages[1] - t_stages[0]) / 1e6)  # imdecode time on receiver
+                        _dec.append((t_stages[1] - t_stages[0]) / 1e6)  # imdecode time on client
                     if 1 in t_stages and 2 in t_stages:
-                        _drw.append((t_stages[2] - t_stages[1]) / 1e6)  # imshow + pollKey time on receiver
+                        _drw.append((t_stages[2] - t_stages[1]) / 1e6)  # imshow + pollKey time on client
                     if 2 in t_stages:
                         _rtt.append((t_stages[2] - t0) / 1e6)
                         if t_enc_start is not None:

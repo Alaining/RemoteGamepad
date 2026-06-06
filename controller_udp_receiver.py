@@ -86,6 +86,6 @@ try:
         except json.JSONDecodeError:
             print("Received invalid JSON data")
 except KeyboardInterrupt:
-    print("\nReceiver shutting down...")
+    print("\nShutting down...")
 finally:
     sock.close()

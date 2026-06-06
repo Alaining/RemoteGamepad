@@ -18,8 +18,8 @@ except ImportError:
 # STEP 2 — Constants
 # ─────────────────────────────────────────────────────────────────────────────
 UDP_PORT = 5006
-ACK_PORT = 5007              # sender listens here for latency ACKs
-HEARTBEAT_INTERVAL = 2.0     # seconds between heartbeats sent to sender when idle
+ACK_PORT = 5007              # server listens here for latency ACKs
+HEARTBEAT_INTERVAL = 2.0     # seconds between heartbeats sent to server when idle
 
 DISPLAY_WIDTH  = 1280        # initial window width  (user can resize freely)
 DISPLAY_HEIGHT = 720         # initial window height
@@ -55,7 +55,7 @@ frames_shown        = 0
 frames_dropped      = 0
 t_stats             = time.perf_counter()
 display_fps         = 0.0  # updated once per second, drawn on each frame
-display_e2e         = 0    # E2E ms from sender header, drawn on each frame
+display_e2e         = 0    # E2E ms from server header, drawn on each frame
 
 known_ack_addr      = None
 last_frame_time     = time.perf_counter()
@@ -129,7 +129,7 @@ try:
         if len(data) < 14:
             continue
         header      = data[:12]                             # seq + timestamp_ns, echoed in ACKs
-        display_e2e = struct.unpack(">H", data[12:14])[0]  # E2E ms from sender
+        display_e2e = struct.unpack(">H", data[12:14])[0]  # E2E ms from server
         jpeg        = data[14:]
 
         # ─────────────────────────────────────────────────────────────────────

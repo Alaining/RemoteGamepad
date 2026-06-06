@@ -5,7 +5,7 @@ import os
 if len(sys.argv) > 1:
     ip = sys.argv[1].strip()
 else:
-    ip = input("Enter the sender's IP address: ").strip()
+    ip = input("Enter the server's IP address: ").strip()
 if not ip:
     ip = "127.0.0.1"
 
@@ -28,4 +28,4 @@ subprocess.Popen(
     creationflags=CREATE_NEW_CONSOLE,
 )
 
-print("Both receivers launched. You can close this window.")
+print("Both client scripts launched. You can close this window.")
