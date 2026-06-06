@@ -45,23 +45,31 @@ function Write-FAIL([string]$msg) { Write-Host "  [X]   $msg" -ForegroundColor R
 function Write-INFO([string]$msg) { Write-Host "        $msg" -ForegroundColor Gray   }
 
 # -- Dot-printer helpers ------------------------------------------------------
-# System.Timers.Timer fires on a threadpool thread, so dots print even while
-# the main thread is blocked on a socket receive or a cmdlet call.
-function Start-Dots([string]$msg) {
-    Write-Host -NoNewline "  $msg" -ForegroundColor Gray
-    $t = [System.Timers.Timer]::new(500)
-    $t.AutoReset = $true
-    $t.add_Elapsed({ [Console]::Write('.') })
-    $t.Start()
-    return $t
+# A System.Timers.Timer with a PS scriptblock callback cannot fire while the
+# main thread is blocked on a .NET call, because the scriptblock needs the PS
+# runspace which the blocked thread is holding.
+# Fix: compile a tiny C# class whose timer callback is a pure .NET lambda --
+# no PS runspace needed, fires reliably even during UdpClient.Receive etc.
+if (-not ([System.Management.Automation.PSTypeName]'RemoteGamepad.DotPrinter').Type) {
+    Add-Type -Namespace RemoteGamepad -Name DotPrinter -MemberDefinition @'
+        private System.Threading.Timer _t;
+        private volatile bool _on;
+        public DotPrinter() {
+            _on = true;
+            _t = new System.Threading.Timer(_ => { if (_on) System.Console.Write('.'); },
+                                            null, 500, 500);
+        }
+        public void Stop() { _on = false; _t.Change(-1, -1); _t.Dispose(); }
+'@
 }
 
-# Stop the dot printer. Does NOT print a newline so the caller can append
-# the result on the same line.
-function Stop-Dots($t) {
-    $t.Enabled = $false
-    $t.Dispose()
+function Start-Dots([string]$msg) {
+    Write-Host -NoNewline "  $msg" -ForegroundColor Gray
+    return [RemoteGamepad.DotPrinter]::new()
 }
+
+# Stop dots. Does NOT print a newline -- caller appends the result on the same line.
+function Stop-Dots($dp) { $dp.Stop() }
 
 # -- Firewall helpers (only for optional rule creation in summary) ------------
 function Find-InboundUDPRule([int]$port) {
