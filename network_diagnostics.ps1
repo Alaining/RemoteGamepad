@@ -217,8 +217,8 @@ if (-not $activeProfiles) {
 # One bulk Get-NetFirewallPortFilter call rather than one per rule avoids the
 # per-rule CIM overhead that made this slow on systems with many rules.
 function Find-InboundUDPRule([int]$port) {
-    $found = Get-NetFirewallPortFilter -Protocol UDP -ErrorAction SilentlyContinue |
-        Where-Object { $_.LocalPort -eq "$port" } |
+    $found = Get-NetFirewallPortFilter -ErrorAction SilentlyContinue |
+        Where-Object { $_.Protocol -eq "UDP" -and [string]$_.LocalPort -eq [string]$port } |
         Get-NetFirewallRule -ErrorAction SilentlyContinue |
         Where-Object { $_.Direction -eq "Inbound" -and $_.Action -eq "Allow" -and $_.Enabled -eq $true }
     if ($found) { return @($found)[0].DisplayName }
