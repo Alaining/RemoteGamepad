@@ -54,14 +54,31 @@ function Write-INFO([string]$msg) { Write-Host "        $msg" -ForegroundColor G
 # no PS runspace needed, fires reliably even during UdpClient.Receive etc.
 if (-not ([System.Management.Automation.PSTypeName]'RemoteGamepad.DotPrinter').Type) {
     Add-Type -Namespace RemoteGamepad -Name DotPrinter -MemberDefinition @'
+        private static readonly object _lock = new object();
+        private static readonly System.Collections.Generic.List<DotPrinter> _active
+            = new System.Collections.Generic.List<DotPrinter>();
+        private static bool _hookSet = false;
         private System.Threading.Timer _t;
         private volatile bool _on;
         public DotPrinter() {
-            _on = true;
+            lock (_lock) {
+                if (!_hookSet) {
+                    System.Console.CancelKeyPress += (s, e) => { StopAll(); };
+                    _hookSet = true;
+                }
+                _on = true;
+                _active.Add(this);
+            }
             _t = new System.Threading.Timer(_ => { if (_on) System.Console.Write('.'); },
                                             null, 500, 500);
         }
-        public void Stop() { _on = false; _t.Change(-1, -1); _t.Dispose(); }
+        public void Stop() {
+            _on = false; _t.Change(-1, -1); _t.Dispose();
+            lock (_lock) { _active.Remove(this); }
+        }
+        public static void StopAll() {
+            lock (_lock) { foreach (var d in _active) d._on = false; }
+        }
 '@
 }
 
