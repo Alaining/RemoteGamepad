@@ -1,29 +1,31 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Network diagnostics for RemoteGamepad -- run on the CLIENT machine.
+    Network diagnostics for RemoteGamepad. Works on both CLIENT and SERVER.
 .DESCRIPTION
     Machine roles:
-      CLIENT  -- your local PC  -- runs video_receiver.py + controller_udp_sender.py
+      CLIENT  -- your local PC    -- runs video_receiver.py + controller_udp_sender.py
       SERVER  -- remote/gaming PC -- runs video_udp_sender.py + controller_udp_receiver.py
 
-    Port layout from the CLIENT's perspective:
-      5005/UDP  controller data  -- CLIENT sends OUT to server  (no inbound rule needed here)
-      5006/UDP  video frames     -- CLIENT listens IN from server (inbound rule required here)
-      5007/UDP  latency ACKs     -- CLIENT sends OUT to server  (no inbound rule needed here)
+    Inbound rules required:
+      CLIENT needs: UDP 5006 (video frames in)
+      SERVER needs: UDP 5005 (controller data in) + UDP 5007 (latency ACKs in)
 .PARAMETER SenderIP
-    IP address of the server machine. If omitted, you will be prompted.
+    IP address of the other machine. If omitted, you will be prompted.
+.PARAMETER Machine
+    Which machine this is: CLIENT or SERVER. If omitted, you will be prompted.
 .EXAMPLE
     .\network_diagnostics.ps1
-    .\network_diagnostics.ps1 192.168.1.50
+    .\network_diagnostics.ps1 192.168.1.50 CLIENT
+    .\network_diagnostics.ps1 192.168.1.50 SERVER
 #>
 
-param([string]$SenderIP)
+param([string]$SenderIP, [string]$Machine)
 
 # -- Ports --------------------------------------------------------------------
-$CONTROLLER_PORT = 5005   # client sends OUT to server (server binds this)
-$VIDEO_PORT      = 5006   # client binds IN (video from server)
-$ACK_PORT        = 5007   # client sends OUT to server (server binds this)
+$CONTROLLER_PORT = 5005   # server binds (controller data from client)
+$VIDEO_PORT      = 5006   # client binds (video from server)
+$ACK_PORT        = 5007   # server binds (latency ACKs from client)
 
 # -- Console helpers ----------------------------------------------------------
 function Write-Section([string]$title) {
@@ -36,9 +38,9 @@ function Write-WARN([string]$msg) { Write-Host "  [!]   $msg" -ForegroundColor Y
 function Write-FAIL([string]$msg) { Write-Host "  [X]   $msg" -ForegroundColor Red    }
 function Write-INFO([string]$msg) { Write-Host "        $msg" -ForegroundColor Gray   }
 
-# -- 0. Collect server IP -----------------------------------------------------
+# -- 0. Collect other machine's IP --------------------------------------------
 if (-not $SenderIP) {
-    $SenderIP = (Read-Host "Enter the SERVER's IP address").Trim()
+    $SenderIP = (Read-Host "Enter the other machine's IP address").Trim()
 }
 $SenderIP = $SenderIP.Trim()
 
@@ -47,11 +49,27 @@ if ($SenderIP -notmatch '^\d{1,3}(\.\d{1,3}){3}$') {
     exit 1
 }
 
+# -- 0b. Determine machine role -----------------------------------------------
+if ($Machine -notmatch '^(CLIENT|SERVER)$') {
+    Write-Host ""
+    Write-Host "  Which machine is this?" -ForegroundColor White
+    Write-Host "   [C] CLIENT  -- local PC        -- video_receiver.py + controller_udp_sender.py"
+    Write-Host "   [S] SERVER  -- remote/gaming PC -- video_udp_sender.py + controller_udp_receiver.py"
+    $choice = Read-Host "  Choice"
+    $Machine = if ($choice -match '^[Ss]') { "SERVER" } else { "CLIENT" }
+}
+$Machine = $Machine.ToUpper()
+
 Write-Host ""
-Write-Host " RemoteGamepad -- Network Diagnostics (CLIENT side) " -ForegroundColor White -BackgroundColor DarkBlue
-Write-Host "  Server IP : $SenderIP"
-Write-Host "  This machine (CLIENT) : video_receiver.py + controller_udp_sender.py"
-Write-Host "  Server machine        : video_udp_sender.py + controller_udp_receiver.py"
+Write-Host " RemoteGamepad -- Network Diagnostics ($Machine) " -ForegroundColor White -BackgroundColor DarkBlue
+Write-Host "  Other machine IP : $SenderIP"
+if ($Machine -eq "CLIENT") {
+    Write-Host "  This machine (CLIENT) : video_receiver.py + controller_udp_sender.py"
+    Write-Host "  Server machine        : video_udp_sender.py + controller_udp_receiver.py"
+} else {
+    Write-Host "  This machine (SERVER) : video_udp_sender.py + controller_udp_receiver.py"
+    Write-Host "  Client machine        : video_receiver.py + controller_udp_sender.py"
+}
 
 # -----------------------------------------------------------------------------
 # 1. PING
@@ -104,13 +122,13 @@ foreach ($addr in $localAddresses) {
     $sharedBytes = [Math]::Floor($maskBits / 8)
     if ($sharedBytes -ge 2 -and
         ($localOctets[0..($sharedBytes-1)] -join ".") -eq ($senderOctets[0..($sharedBytes-1)] -join ".")) {
-        Write-OK "Server appears to be on the same LAN subnet ($($addr.IPAddress)/$maskBits)"
+        Write-OK "Other machine appears to be on the same LAN subnet ($($addr.IPAddress)/$maskBits)"
         $onSameLAN = $true
         break
     }
 }
 if (-not $onSameLAN) {
-    Write-WARN "Server appears to be on a different subnet -- NAT/routing will be involved"
+    Write-WARN "Other machine appears to be on a different subnet -- NAT/routing will be involved"
     Write-INFO "  Make sure port forwarding is configured on the server's router for UDP 5005 and 5007."
 }
 
@@ -138,8 +156,7 @@ $udpMax = 65535 - 20 - 8 - 12   # IP - UDP - RemoteGamepad frame header
 Write-INFO "  Max usable UDP payload : $udpMax bytes"
 Write-INFO "  MJPEG frames at 480p are typically 10-50 KB -- well within the limit"
 
-# Test path MTU using ping with Don't-Fragment bit
-Write-INFO "  Testing path MTU to server (DF-bit ping)..."
+Write-INFO "  Testing path MTU to other machine (DF-bit ping)..."
 $pmtuOk = $false
 foreach ($size in @(1472, 1400, 1000)) {
     # -f sets DF bit; -l sets payload size
@@ -155,7 +172,7 @@ if (-not $pmtuOk) {
 }
 
 # -----------------------------------------------------------------------------
-# 4. WINDOWS FIREWALL -- INBOUND RULES (CLIENT side)
+# 4. WINDOWS FIREWALL -- INBOUND RULES
 # -----------------------------------------------------------------------------
 Write-Section "4. Windows Firewall -- Inbound Rules"
 
@@ -166,30 +183,67 @@ if (-not $activeProfiles) {
     Write-INFO "  Firewall active on: $(($activeProfiles.Name) -join ", ")"
 }
 
-Write-INFO "  Only UDP $VIDEO_PORT (video) needs an inbound rule here."
-Write-INFO "  UDP $CONTROLLER_PORT and $ACK_PORT are outbound-only from this machine -- no inbound rules needed."
-
+# Strict match: require explicit UDP protocol AND exact port number.
+# Broad catch-all rules (Protocol=Any or LocalPort=Any) are intentionally
+# ignored -- they produce false positives (e.g. Wi-Fi Direct Spooler) and
+# don't confirm that the specific port is intentionally open.
 function Find-InboundUDPRule([int]$port) {
     $rules = Get-NetFirewallRule -Direction Inbound -Action Allow -Enabled True -ErrorAction SilentlyContinue
     foreach ($rule in $rules) {
         $pf = $rule | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue
-        if ($pf -and
-            ($pf.Protocol -eq "UDP" -or $pf.Protocol -eq "Any") -and
-            ($pf.LocalPort -eq "$port" -or $pf.LocalPort -eq "Any")) {
+        if ($pf -and $pf.Protocol -eq "UDP" -and $pf.LocalPort -eq "$port") {
             return $rule.DisplayName
         }
     }
     return $null
 }
 
-Write-Host -NoNewline "  Checking UDP $VIDEO_PORT (video frames, inbound)... " -ForegroundColor Gray
-$video5006Rule = Find-InboundUDPRule -port $VIDEO_PORT
-if ($video5006Rule) {
-    Write-Host "[OK]  Rule: $video5006Rule" -ForegroundColor Green
-} else {
-    Write-Host "[MISSING]" -ForegroundColor Red
+function Invoke-CreateFirewallRule([int]$port, [string]$label) {
+    $displayName = "RemoteGamepad $label UDP $port"
+    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)
+
+    if ($isAdmin) {
+        try {
+            New-NetFirewallRule -DisplayName $displayName `
+                -Direction Inbound -Protocol UDP -LocalPort $port `
+                -Action Allow -Profile Any -ErrorAction Stop | Out-Null
+            Write-OK "Rule created: $displayName"
+        } catch {
+            Write-FAIL "Could not create rule: $($_.Exception.Message)"
+        }
+    } else {
+        $cmd = "New-NetFirewallRule -DisplayName '$displayName' " +
+               "-Direction Inbound -Protocol UDP -LocalPort $port -Action Allow -Profile Any | Out-Null; " +
+               "Write-Host 'Done.' -ForegroundColor Green; Read-Host"
+        Write-INFO "  Launching elevated PowerShell to create rule..."
+        Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -Command `"$cmd`""
+        Write-INFO "  Rule will be created in the elevated window."
+    }
 }
-Write-INFO "  UDP $CONTROLLER_PORT and $ACK_PORT are outbound -- inbound rules needed on the SERVER, not here."
+
+function Test-AndPromptRule([int]$port, [string]$label) {
+    Write-Host -NoNewline "  Checking UDP $port ($label, inbound)... " -ForegroundColor Gray
+    $ruleName = Find-InboundUDPRule -port $port
+    if ($ruleName) {
+        Write-Host "[OK]  Rule: $ruleName" -ForegroundColor Green
+        return $true
+    } else {
+        Write-Host "[MISSING]" -ForegroundColor Red
+        return $false
+    }
+}
+
+if ($Machine -eq "CLIENT") {
+    Write-INFO "  CLIENT needs inbound: UDP $VIDEO_PORT (video)."
+    Write-INFO "  UDP $CONTROLLER_PORT and $ACK_PORT are outbound-only from this machine."
+    $rule5006Found = Test-AndPromptRule -port $VIDEO_PORT -label "Video frames"
+} else {
+    Write-INFO "  SERVER needs inbound: UDP $CONTROLLER_PORT (controller) and UDP $ACK_PORT (ACKs)."
+    Write-INFO "  UDP $VIDEO_PORT is outbound-only from this machine (video sent to client)."
+    $rule5005Found = Test-AndPromptRule -port $CONTROLLER_PORT -label "Controller data"
+    $rule5007Found = Test-AndPromptRule -port $ACK_PORT        -label "Latency ACKs"
+}
 
 # -----------------------------------------------------------------------------
 # 5. PORT AVAILABILITY -- IS ANYTHING ALREADY BOUND?
@@ -198,34 +252,43 @@ Write-Section "5. Port Availability (is anything already listening?)"
 
 $netstatOutput = netstat -an -p UDP
 
-# UDP 5006 is the only port the client binds
-$bound = $netstatOutput | Select-String "[\s:]$VIDEO_PORT\s"
-if ($bound) {
-    Write-OK "UDP $VIDEO_PORT -- already bound (video_receiver.py may be running)"
-} else {
-    try {
-        $sock = New-Object System.Net.Sockets.UdpClient($VIDEO_PORT)
-        $sock.Close()
-        Write-INFO "  UDP $VIDEO_PORT -- not bound; ready for video_receiver.py to use"
-    } catch {
-        Write-WARN "UDP $VIDEO_PORT -- bind failed: port already in use by another app"
+function Test-PortBound([int]$port, [string]$scriptName, [bool]$shouldBind) {
+    $bound = $netstatOutput | Select-String "[\s:]$port\s"
+    if ($bound) {
+        if ($shouldBind) {
+            Write-OK "UDP $port -- already bound ($scriptName may be running)"
+        } else {
+            Write-WARN "UDP $port -- already bound locally (another app may interfere)"
+        }
+    } else {
+        if ($shouldBind) {
+            try {
+                $sock = New-Object System.Net.Sockets.UdpClient($port)
+                $sock.Close()
+                Write-INFO "  UDP $port -- not bound; ready for $scriptName to use"
+            } catch {
+                Write-WARN "UDP $port -- bind failed: port already in use by another app"
+            }
+        } else {
+            Write-INFO "  UDP $port -- not bound locally (correct -- this machine sends to this port, never binds it)"
+        }
     }
 }
 
-# 5005 and 5007 are outbound -- just check nothing else grabbed them locally
-foreach ($port in @($CONTROLLER_PORT, $ACK_PORT)) {
-    $abound = $netstatOutput | Select-String "[\s:]$port\s"
-    if ($abound) {
-        Write-WARN "UDP $port -- already bound locally (another app may interfere with outbound traffic)"
-    } else {
-        Write-INFO "  UDP $port -- not bound locally (correct -- this machine sends to server:$port, never binds it)"
-    }
+if ($Machine -eq "CLIENT") {
+    Test-PortBound -port $VIDEO_PORT       -scriptName "video_receiver.py"       -shouldBind $true
+    Test-PortBound -port $CONTROLLER_PORT  -scriptName "controller_udp_sender.py" -shouldBind $false
+    Test-PortBound -port $ACK_PORT         -scriptName "video_receiver.py"        -shouldBind $false
+} else {
+    Test-PortBound -port $CONTROLLER_PORT  -scriptName "controller_udp_receiver.py" -shouldBind $true
+    Test-PortBound -port $ACK_PORT         -scriptName "video_udp_sender.py"        -shouldBind $true
+    Test-PortBound -port $VIDEO_PORT       -scriptName "video_udp_sender.py"        -shouldBind $false
 }
 
 # -----------------------------------------------------------------------------
 # 6. ROUTE TRACE
 # -----------------------------------------------------------------------------
-Write-Section "6. Route to Server (up to 10 hops)"
+Write-Section "6. Route to Other Machine (up to 10 hops)"
 
 try {
     $trace = Test-NetConnection -ComputerName $SenderIP -TraceRoute -Hops 10 `
@@ -251,66 +314,57 @@ try {
 # -----------------------------------------------------------------------------
 Write-Section "7. Summary"
 Write-Host ""
-Write-Host "  Port layout (CLIENT perspective):" -ForegroundColor White
 
-# 5005 -- outbound, rule needed on server
-Write-Host "    5005/UDP  Controller data  CLIENT sends --> server  " -NoNewline
-Write-Host "[rule needed on SERVER]" -ForegroundColor Yellow
-
-# 5006 -- inbound, check live status
-Write-Host "    5006/UDP  Video frames     CLIENT listens <-- server " -NoNewline
-if ($video5006Rule) {
-    Write-Host "[OK]  $video5006Rule" -ForegroundColor Green
-} else {
-    Write-Host "[MISSING]" -ForegroundColor Red
-}
-
-# 5007 -- outbound, rule needed on server
-Write-Host "    5007/UDP  Latency ACKs     CLIENT sends --> server  " -NoNewline
-Write-Host "[rule needed on SERVER]" -ForegroundColor Yellow
-
-Write-Host ""
-
-# Prompt to create 5006 rule if still missing
-if (-not $video5006Rule) {
-    Write-WARN "UDP $VIDEO_PORT has no inbound firewall rule -- video stream will not work."
+if ($Machine -eq "CLIENT") {
+    Write-Host "  Port layout (CLIENT perspective):" -ForegroundColor White
+    Write-Host "    5005/UDP  Controller data  CLIENT sends --> server  " -NoNewline
+    Write-Host "[rule needed on SERVER]" -ForegroundColor Yellow
+    Write-Host "    5006/UDP  Video frames     CLIENT listens <-- server " -NoNewline
+    if ($rule5006Found) { Write-Host "[OK]" -ForegroundColor Green } else { Write-Host "[MISSING]" -ForegroundColor Red }
+    Write-Host "    5007/UDP  Latency ACKs     CLIENT sends --> server  " -NoNewline
+    Write-Host "[rule needed on SERVER]" -ForegroundColor Yellow
     Write-Host ""
-    Write-Host "  Create the inbound rule for UDP $VIDEO_PORT now?" -ForegroundColor Yellow
-    Write-Host "   [Y] Yes"
-    Write-Host "   [N] No"
-    $answer = Read-Host "  Choice"
 
-    if ($answer -match "^[Yy]") {
-        $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
-            [Security.Principal.WindowsBuiltInRole]::Administrator)
-
-        if ($isAdmin) {
-            try {
-                New-NetFirewallRule `
-                    -DisplayName "RemoteGamepad Video Stream UDP $VIDEO_PORT" `
-                    -Direction Inbound -Protocol UDP -LocalPort $VIDEO_PORT `
-                    -Action Allow -Profile Any -ErrorAction Stop | Out-Null
-                Write-OK "Rule created for UDP $VIDEO_PORT"
-            } catch {
-                Write-FAIL "Could not create rule: $($_.Exception.Message)"
-            }
-        } else {
-            $cmd = "New-NetFirewallRule -DisplayName 'RemoteGamepad Video Stream UDP $VIDEO_PORT' " +
-                   "-Direction Inbound -Protocol UDP -LocalPort $VIDEO_PORT -Action Allow -Profile Any | Out-Null; " +
-                   "Write-Host 'Done.' -ForegroundColor Green; Read-Host"
-            Write-INFO "  Launching elevated PowerShell to create rule..."
-            Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -Command `"$cmd`""
-            Write-INFO "  Rule will be created in the elevated window."
+    if (-not $rule5006Found) {
+        Write-WARN "UDP $VIDEO_PORT has no inbound rule -- video stream will not work."
+        Write-Host ""
+        Write-Host "  Create the inbound rule for UDP $VIDEO_PORT now? [Y/N]" -ForegroundColor Yellow
+        if ((Read-Host "  Choice") -match "^[Yy]") {
+            Invoke-CreateFirewallRule -port $VIDEO_PORT -label "Video Stream"
         }
+    } else {
+        Write-OK "Firewall is set up correctly for this CLIENT machine."
     }
 } else {
-    Write-OK "Firewall rule for UDP $VIDEO_PORT is in place -- video stream should work."
+    Write-Host "  Port layout (SERVER perspective):" -ForegroundColor White
+    Write-Host "    5005/UDP  Controller data  SERVER listens <-- client " -NoNewline
+    if ($rule5005Found) { Write-Host "[OK]" -ForegroundColor Green } else { Write-Host "[MISSING]" -ForegroundColor Red }
+    Write-Host "    5006/UDP  Video frames     SERVER sends --> client  " -NoNewline
+    Write-Host "[rule needed on CLIENT]" -ForegroundColor Yellow
+    Write-Host "    5007/UDP  Latency ACKs     SERVER listens <-- client " -NoNewline
+    if ($rule5007Found) { Write-Host "[OK]" -ForegroundColor Green } else { Write-Host "[MISSING]" -ForegroundColor Red }
+    Write-Host ""
+
+    $anyMissing = (-not $rule5005Found) -or (-not $rule5007Found)
+    if ($anyMissing) {
+        $missingList = @()
+        if (-not $rule5005Found) { $missingList += "UDP $CONTROLLER_PORT (Controller data)" }
+        if (-not $rule5007Found) { $missingList += "UDP $ACK_PORT (Latency ACKs)" }
+        Write-WARN "Missing inbound rules: $($missingList -join ", ")"
+        Write-Host ""
+        Write-Host "  Create the missing rules now? [Y/N]" -ForegroundColor Yellow
+        if ((Read-Host "  Choice") -match "^[Yy]") {
+            if (-not $rule5005Found) { Invoke-CreateFirewallRule -port $CONTROLLER_PORT -label "Controller Data" }
+            if (-not $rule5007Found) { Invoke-CreateFirewallRule -port $ACK_PORT        -label "Latency ACKs"   }
+        }
+    } else {
+        Write-OK "Firewall is set up correctly for this SERVER machine."
+    }
 }
 
 Write-Host ""
 Write-Host "  Other tips:" -ForegroundColor White
-Write-Host "    * Rules for 5005 and 5007        -> run this script on the SERVER machine"
-Write-Host "    * High latency / many hops       -> prefer wired Ethernet or same LAN"
-Write-Host "    * MTU issues                     -> run setup_jumbo_frames.ps1 on both machines (LAN only)"
-Write-Host "    * Bind failure on 5006           -> stop any running video_receiver.py first"
+Write-Host "    * Run this script on the other machine too to check its firewall rules"
+Write-Host "    * High latency / many hops  -> prefer wired Ethernet or same LAN"
+Write-Host "    * MTU issues                -> run setup_jumbo_frames.ps1 on both machines (LAN only)"
 Write-Host ""
