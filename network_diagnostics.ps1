@@ -214,14 +214,14 @@ if (-not $activeProfiles) {
 # Strict match: Protocol must be UDP and LocalPort must be the exact port.
 # Catch-all rules (Protocol=Any or LocalPort=Any) are ignored to avoid
 # false positives from unrelated Windows rules (e.g. Wi-Fi Direct Spooler).
+# One bulk Get-NetFirewallPortFilter call rather than one per rule avoids the
+# per-rule CIM overhead that made this slow on systems with many rules.
 function Find-InboundUDPRule([int]$port) {
-    $rules = Get-NetFirewallRule -Direction Inbound -Action Allow -Enabled True -ErrorAction SilentlyContinue
-    foreach ($rule in $rules) {
-        $pf = $rule | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue
-        if ($pf -and $pf.Protocol -eq "UDP" -and $pf.LocalPort -eq "$port") {
-            return $rule.DisplayName
-        }
-    }
+    $found = Get-NetFirewallPortFilter -Protocol UDP -ErrorAction SilentlyContinue |
+        Where-Object { $_.LocalPort -eq "$port" } |
+        Get-NetFirewallRule -ErrorAction SilentlyContinue |
+        Where-Object { $_.Direction -eq "Inbound" -and $_.Action -eq "Allow" -and $_.Enabled -eq $true }
+    if ($found) { return @($found)[0].DisplayName }
     return $null
 }
 
