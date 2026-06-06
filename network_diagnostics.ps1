@@ -226,6 +226,14 @@ function Find-InboundUDPRule([int]$port) {
 }
 
 function Invoke-CreateFirewallRule([int]$port, [string]$label) {
+    # Re-check: another rule may already cover this port (e.g. created between
+    # the earlier lookup and the user answering the prompt).
+    $existing = Find-InboundUDPRule -port $port
+    if ($existing) {
+        Write-OK "Rule already exists: $existing  (no action taken)"
+        return
+    }
+
     $displayName = "RemoteGamepad $label UDP $port"
     $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -373,9 +381,11 @@ if ($Machine -eq "CLIENT") {
     Write-Host ""
 
     if (-not $rule5006Found) {
-        Write-WARN "UDP $VIDEO_PORT has no inbound rule -- video stream will not work."
+        Write-WARN "No inbound rule found for UDP $VIDEO_PORT (video)."
+        Write-INFO "  This may block video -- but the server might simply not be streaming yet."
+        Write-INFO "  Only create a rule if you are sure one is missing."
         Write-Host ""
-        Write-Host "  Create the inbound rule for UDP $VIDEO_PORT now? [Y/N]" -ForegroundColor Yellow
+        Write-Host "  Create an inbound allow rule for UDP $VIDEO_PORT now? [Y/N]" -ForegroundColor Yellow
         if ((Read-Host "  Choice") -match "^[Yy]") {
             Invoke-CreateFirewallRule -port $VIDEO_PORT -label "Video Stream"
         }
@@ -395,11 +405,12 @@ if ($Machine -eq "CLIENT") {
     $anyMissing = (-not $rule5005Found) -or (-not $rule5007Found)
     if ($anyMissing) {
         $missingList = @()
-        if (-not $rule5005Found) { $missingList += "UDP $CONTROLLER_PORT (Controller data)" }
-        if (-not $rule5007Found) { $missingList += "UDP $ACK_PORT (Latency ACKs)" }
-        Write-WARN "Missing inbound rules: $($missingList -join ", ")"
+        if (-not $rule5005Found) { $missingList += "UDP $CONTROLLER_PORT (controller data)" }
+        if (-not $rule5007Found) { $missingList += "UDP $ACK_PORT (latency ACKs)" }
+        Write-WARN "No inbound rules found for: $($missingList -join ", ")"
+        Write-INFO "  Only create rules if you are sure they are missing."
         Write-Host ""
-        Write-Host "  Create the missing rules now? [Y/N]" -ForegroundColor Yellow
+        Write-Host "  Create inbound allow rules for the missing ports now? [Y/N]" -ForegroundColor Yellow
         if ((Read-Host "  Choice") -match "^[Yy]") {
             if (-not $rule5005Found) { Invoke-CreateFirewallRule -port $CONTROLLER_PORT -label "Controller Data" }
             if (-not $rule5007Found) { Invoke-CreateFirewallRule -port $ACK_PORT        -label "Latency ACKs"   }
