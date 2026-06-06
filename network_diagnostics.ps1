@@ -183,51 +183,13 @@ function Find-InboundUDPRule([int]$port) {
 }
 
 Write-Host -NoNewline "  Checking UDP $VIDEO_PORT (video frames, inbound)... " -ForegroundColor Gray
-$ruleName = Find-InboundUDPRule -port $VIDEO_PORT
-if ($ruleName) {
-    Write-Host "[OK]  Rule: $ruleName" -ForegroundColor Green
-    $missingVideo = $false
+$video5006Rule = Find-InboundUDPRule -port $VIDEO_PORT
+if ($video5006Rule) {
+    Write-Host "[OK]  Rule: $video5006Rule" -ForegroundColor Green
 } else {
     Write-Host "[MISSING]" -ForegroundColor Red
-    $missingVideo = $true
 }
-
-if ($missingVideo) {
-    Write-Host ""
-    Write-WARN "Missing inbound firewall rule for UDP $VIDEO_PORT"
-    Write-Host ""
-    Write-Host "  Create the missing rule now?" -ForegroundColor Yellow
-    Write-Host "   [Y] Yes -- open an elevated window and create it"
-    Write-Host "   [N] No  -- skip (you can re-run this script later)"
-    $answer = Read-Host "  Choice"
-
-    if ($answer -match "^[Yy]") {
-        $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
-            [Security.Principal.WindowsBuiltInRole]::Administrator)
-
-        if ($isAdmin) {
-            try {
-                New-NetFirewallRule `
-                    -DisplayName "RemoteGamepad Video Stream UDP $VIDEO_PORT" `
-                    -Direction Inbound -Protocol UDP -LocalPort $VIDEO_PORT `
-                    -Action Allow -Profile Any -ErrorAction Stop | Out-Null
-                Write-OK "Created inbound rule for UDP $VIDEO_PORT"
-            } catch {
-                Write-FAIL "Could not create rule: $($_.Exception.Message)"
-            }
-        } else {
-            $cmd = "New-NetFirewallRule -DisplayName 'RemoteGamepad Video Stream UDP $VIDEO_PORT' " +
-                   "-Direction Inbound -Protocol UDP -LocalPort $VIDEO_PORT -Action Allow -Profile Any | Out-Null; " +
-                   "Write-Host 'Done.' -ForegroundColor Green; Read-Host"
-            Write-INFO "  Launching elevated PowerShell to create rule..."
-            Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -Command `"$cmd`""
-            Write-INFO "  Rule will be created in the elevated window. Re-run this script to verify."
-        }
-    }
-}
-
-Write-Host ""
-Write-WARN "Remember: UDP $CONTROLLER_PORT and $ACK_PORT need inbound rules on the SENDER machine, not here."
+Write-INFO "  UDP $CONTROLLER_PORT and $ACK_PORT are outbound -- inbound rules needed on the SENDER, not here."
 
 # -----------------------------------------------------------------------------
 # 5. PORT AVAILABILITY -- IS ANYTHING ALREADY BOUND?
@@ -290,12 +252,63 @@ try {
 Write-Section "7. Summary"
 Write-Host ""
 Write-Host "  Port layout (RECEIVER perspective):" -ForegroundColor White
-Write-Host "    5005/UDP  Controller data  RECEIVER sends --> sender  (inbound rule needed on SENDER)"
-Write-Host "    5006/UDP  Video frames     RECEIVER listens <-- sender (inbound rule needed HERE)"
-Write-Host "    5007/UDP  Latency ACKs     RECEIVER sends --> sender  (inbound rule needed on SENDER)"
+
+# 5005 -- outbound, rule needed on sender
+Write-Host "    5005/UDP  Controller data  RECEIVER sends --> sender  " -NoNewline
+Write-Host "[rule needed on SENDER]" -ForegroundColor Yellow
+
+# 5006 -- inbound, check live status
+Write-Host "    5006/UDP  Video frames     RECEIVER listens <-- sender " -NoNewline
+if ($video5006Rule) {
+    Write-Host "[OK]  $video5006Rule" -ForegroundColor Green
+} else {
+    Write-Host "[MISSING]" -ForegroundColor Red
+}
+
+# 5007 -- outbound, rule needed on sender
+Write-Host "    5007/UDP  Latency ACKs     RECEIVER sends --> sender  " -NoNewline
+Write-Host "[rule needed on SENDER]" -ForegroundColor Yellow
+
 Write-Host ""
-Write-Host "  If any tests failed:" -ForegroundColor White
-Write-Host "    * Missing inbound rule for 5006  -> re-run this script and choose Y when prompted"
+
+# Prompt to create 5006 rule if still missing
+if (-not $video5006Rule) {
+    Write-WARN "UDP $VIDEO_PORT has no inbound firewall rule -- video stream will not work."
+    Write-Host ""
+    Write-Host "  Create the inbound rule for UDP $VIDEO_PORT now?" -ForegroundColor Yellow
+    Write-Host "   [Y] Yes"
+    Write-Host "   [N] No"
+    $answer = Read-Host "  Choice"
+
+    if ($answer -match "^[Yy]") {
+        $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator)
+
+        if ($isAdmin) {
+            try {
+                New-NetFirewallRule `
+                    -DisplayName "RemoteGamepad Video Stream UDP $VIDEO_PORT" `
+                    -Direction Inbound -Protocol UDP -LocalPort $VIDEO_PORT `
+                    -Action Allow -Profile Any -ErrorAction Stop | Out-Null
+                Write-OK "Rule created for UDP $VIDEO_PORT"
+            } catch {
+                Write-FAIL "Could not create rule: $($_.Exception.Message)"
+            }
+        } else {
+            $cmd = "New-NetFirewallRule -DisplayName 'RemoteGamepad Video Stream UDP $VIDEO_PORT' " +
+                   "-Direction Inbound -Protocol UDP -LocalPort $VIDEO_PORT -Action Allow -Profile Any | Out-Null; " +
+                   "Write-Host 'Done.' -ForegroundColor Green; Read-Host"
+            Write-INFO "  Launching elevated PowerShell to create rule..."
+            Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -Command `"$cmd`""
+            Write-INFO "  Rule will be created in the elevated window."
+        }
+    }
+} else {
+    Write-OK "Firewall rule for UDP $VIDEO_PORT is in place -- video stream should work."
+}
+
+Write-Host ""
+Write-Host "  Other tips:" -ForegroundColor White
 Write-Host "    * Rules for 5005 and 5007        -> run this script on the SENDER machine"
 Write-Host "    * High latency / many hops       -> prefer wired Ethernet or same LAN"
 Write-Host "    * MTU issues                     -> run setup_jumbo_frames.ps1 on both machines (LAN only)"
