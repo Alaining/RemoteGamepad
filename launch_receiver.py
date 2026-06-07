@@ -24,7 +24,13 @@ diag_cmd = ["powershell.exe", "-ExecutionPolicy", "Bypass", "-File",
             os.path.join(script_dir, "network_diagnostics.ps1"), ip, "CLIENT"]
 if wait_mode:
     diag_cmd.append("-Wait")
-diag = subprocess.run(diag_cmd)
+try:
+    diag = subprocess.run(diag_cmd)
+except KeyboardInterrupt:
+    print()
+    sys.exit(0)
+if diag.returncode == 2:
+    sys.exit(1)   # user already chose to abort inside the diagnostics
 if diag.returncode != 0:
     answer = input("\nNetwork diagnostics reported issues. Launch anyway? [Y/N]: ").strip()
     if not answer.lower().startswith("y"):
