@@ -131,74 +131,82 @@ function Invoke-CreateFirewallRule([int]$port, [string]$label) {
     }
 }
 
-# Runs the UDP connectivity test. Returns @{ p5005; p5006; p5007 } booleans.
-# All 3 port tests run as parallel background jobs so worst-case time is
-# 1 × $TIMEOUT_MS instead of 3 × $TIMEOUT_MS.
-function Invoke-UDPTest {
-    $p5005 = $false; $p5006 = $false; $p5007 = $false
+# -- UDP test scriptblocks at script scope so both Start-UDPJobs (early start)
+# and Invoke-UDPTest (summary re-run) share them without re-definition. -------
 
-    # Job: bind $port, echo PONG to the first probe that arrives.
-    $receiveScript = {
-        param([int]$port, [int]$timeout)
-        $pong = [System.Text.Encoding]::ASCII.GetBytes("PONG")
-        $s    = $null
-        try {
-            $s = New-Object System.Net.Sockets.UdpClient
-            $s.Client.Bind([System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, $port))
-            $s.Client.ReceiveTimeout = 2000
-            $ep       = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
-            $deadline = [DateTime]::UtcNow.AddMilliseconds($timeout)
-            while ([DateTime]::UtcNow -lt $deadline) {
-                try {
-                    $null = $s.Receive([ref]$ep)
-                    $s.Send($pong, $pong.Length, $ep) | Out-Null
-                    return $true
-                } catch { }
-            }
-        } catch { }
-        finally { if ($s) { $s.Close() } }
-        return $false
-    }
+# Job: bind $port, echo PONG to the first DIAG probe that arrives.
+$receiveScript = {
+    param([int]$port, [int]$timeout)
+    $pong = [System.Text.Encoding]::ASCII.GetBytes("PONG")
+    $s    = $null
+    try {
+        $s = New-Object System.Net.Sockets.UdpClient
+        $s.Client.Bind([System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, $port))
+        $s.Client.ReceiveTimeout = 2000
+        $ep       = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
+        $deadline = [DateTime]::UtcNow.AddMilliseconds($timeout)
+        while ([DateTime]::UtcNow -lt $deadline) {
+            try {
+                $null = $s.Receive([ref]$ep)
+                $s.Send($pong, $pong.Length, $ep) | Out-Null
+                return $true
+            } catch { }
+        }
+    } catch { }
+    finally { if ($s) { $s.Close() } }
+    return $false
+}
 
-    # Job: send DIAG to $ip:$port every 2s, return $true when PONG is received.
-    $probeScript = {
-        param([string]$ip, [int]$port, [int]$timeout)
-        $diag = [System.Text.Encoding]::ASCII.GetBytes("DIAG")
-        $s    = $null
-        try {
-            $s = New-Object System.Net.Sockets.UdpClient
-            $s.Client.ReceiveTimeout = 2000
-            $ep       = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
-            $deadline = [DateTime]::UtcNow.AddMilliseconds($timeout)
-            while ([DateTime]::UtcNow -lt $deadline) {
-                try {
-                    $s.Send($diag, $diag.Length, $ip, $port) | Out-Null
-                    $null = $s.Receive([ref]$ep)
-                    return $true
-                } catch { }
-            }
-        } catch { }
-        finally { if ($s) { $s.Close() } }
-        return $false
-    }
+# Job: send DIAG to $ip:$port every 2s, return $true when PONG is received.
+$probeScript = {
+    param([string]$ip, [int]$port, [int]$timeout)
+    $diag = [System.Text.Encoding]::ASCII.GetBytes("DIAG")
+    $s    = $null
+    try {
+        $s = New-Object System.Net.Sockets.UdpClient
+        $s.Client.ReceiveTimeout = 2000
+        $ep       = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
+        $deadline = [DateTime]::UtcNow.AddMilliseconds($timeout)
+        while ([DateTime]::UtcNow -lt $deadline) {
+            try {
+                $s.Send($diag, $diag.Length, $ip, $port) | Out-Null
+                $null = $s.Receive([ref]$ep)
+                return $true
+            } catch { }
+        }
+    } catch { }
+    finally { if ($s) { $s.Close() } }
+    return $false
+}
 
+# Starts the 3 UDP port background jobs. For SERVER, also prints the "run on
+# CLIENT" banner so the operator can start the CLIENT while sections 1-3 run.
+# Returns @{ j5005; j5006; j5007 }.
+function Start-UDPJobs {
     if ($Machine -eq "SERVER") {
         $thisIP = if ($localAddresses) { $localAddresses[0].IPAddress } else { "?" }
         Write-Host ""
         Write-Host "  --> Run this on the CLIENT machine now:" -ForegroundColor Yellow
         Write-Host "      .\network_diagnostics.ps1 $thisIP CLIENT" -ForegroundColor White
         Write-Host ""
-
-        $j5005 = Start-Job $receiveScript -ArgumentList $CONTROLLER_PORT, $TIMEOUT_MS
-        $j5007 = Start-Job $receiveScript -ArgumentList $ACK_PORT,        $TIMEOUT_MS
-        $j5006 = Start-Job $probeScript   -ArgumentList $SenderIP, $VIDEO_PORT, $TIMEOUT_MS
+        return @{
+            j5005 = Start-Job $receiveScript -ArgumentList $CONTROLLER_PORT, $TIMEOUT_MS
+            j5007 = Start-Job $receiveScript -ArgumentList $ACK_PORT,        $TIMEOUT_MS
+            j5006 = Start-Job $probeScript   -ArgumentList $SenderIP, $VIDEO_PORT, $TIMEOUT_MS
+        }
     } else {
-        # Start the 5006 receive job first so the OS begins buffering any probe
-        # that arrives from the server before the job has fully initialised.
-        $j5006 = Start-Job $receiveScript -ArgumentList $VIDEO_PORT, $TIMEOUT_MS
-        $j5005 = Start-Job $probeScript   -ArgumentList $SenderIP, $CONTROLLER_PORT, $TIMEOUT_MS
-        $j5007 = Start-Job $probeScript   -ArgumentList $SenderIP, $ACK_PORT,        $TIMEOUT_MS
+        return @{
+            j5006 = Start-Job $receiveScript -ArgumentList $VIDEO_PORT, $TIMEOUT_MS
+            j5005 = Start-Job $probeScript   -ArgumentList $SenderIP, $CONTROLLER_PORT, $TIMEOUT_MS
+            j5007 = Start-Job $probeScript   -ArgumentList $SenderIP, $ACK_PORT,        $TIMEOUT_MS
+        }
     }
+}
+
+# Waits for pre-started UDP jobs, displays pass/fail per port, removes jobs.
+# Returns @{ p5005; p5006; p5007 }.
+function Collect-UDPJobs($udpJobs) {
+    $j5005 = $udpJobs.j5005; $j5007 = $udpJobs.j5007; $j5006 = $udpJobs.j5006
 
     $dt = Start-Dots "Testing all 3 UDP ports in parallel ($timeoutLabel)"
     Wait-Job $j5005, $j5007, $j5006 | Out-Null
@@ -228,6 +236,9 @@ function Invoke-UDPTest {
 
     return @{ p5005 = $p5005; p5006 = $p5006; p5007 = $p5007 }
 }
+
+# Thin wrapper used by the summary re-run after firewall rule creation.
+function Invoke-UDPTest { return Collect-UDPJobs (Start-UDPJobs) }
 
 # -- 0. Collect other machine's IP --------------------------------------------
 if (-not $SenderIP) { $SenderIP = (Read-Host "Enter the other machine's IP address").Trim() }
@@ -259,8 +270,19 @@ if ($Machine -eq "CLIENT") {
     Write-Host "  Client machine at     : $SenderIP"
 }
 
-# -- Start slow network checks in background jobs so they overlap with other steps.
-# Traceroute result is consumed at step 6; MTU result is consumed at step 3.
+# -- Compute local addresses now (before background jobs) so Start-UDPJobs can
+# use them for the SERVER "run on CLIENT" banner that appears before section 1.
+$allLocalAddresses = Get-NetIPAddress -AddressFamily IPv4 |
+    Where-Object { $_.IPAddress -ne "127.0.0.1" -and $_.PrefixOrigin -ne "WellKnown" }
+if ($relevantIfIndex) {
+    $localAddresses = @($allLocalAddresses | Where-Object { $_.InterfaceIndex -eq $relevantIfIndex })
+    if (-not $localAddresses) { $localAddresses = $allLocalAddresses }
+} else { $localAddresses = $allLocalAddresses }
+
+# -- Start all long-running background jobs before section 1 so ping, MTU,
+# traceroute, and UDP tests all run in parallel with each other.
+# Results consumed at: section 1 ($pingJob), section 3 ($mtuJob),
+# section 4 ($udpJobs), section 6 ($traceJob).
 $traceJob = Start-Job -ScriptBlock {
     param($ip)
     try { Test-NetConnection -ComputerName $ip -TraceRoute -Hops 10 `
@@ -276,48 +298,54 @@ $mtuJob = Start-Job -ScriptBlock {
     return 0
 } -ArgumentList $SenderIP
 
+$pingJob = Start-Job -ScriptBlock {
+    param($ip)
+    $pings = Test-Connection -ComputerName $ip -Count 3 -ErrorAction SilentlyContinue
+    if (-not $pings -or $pings.Count -eq 0) { return $null }
+    $rtts = @($pings | ForEach-Object { $_.ResponseTime })
+    return @{
+        Count = $pings.Count
+        Min   = ($rtts | Measure-Object -Minimum).Minimum
+        Max   = ($rtts | Measure-Object -Maximum).Maximum
+        Avg   = [Math]::Round(($rtts | Measure-Object -Average).Average, 1)
+    }
+} -ArgumentList $SenderIP
+
+# Start UDP port jobs. For SERVER, Start-UDPJobs also prints the "run on CLIENT"
+# banner right now so the operator can kick off the CLIENT while sections 1-3 run.
+$udpJobs = Start-UDPJobs
+
 # =============================================================================
 # 1. PING
 # =============================================================================
 Write-Section "1. Ping"
 
 $dt = Start-Dots "Pinging $SenderIP (3 packets)"
-$pings = Test-Connection -ComputerName $SenderIP -Count 3 -ErrorAction SilentlyContinue
+Wait-Job $pingJob | Out-Null
 Stop-Dots $dt
 Write-Host ""
 
-if (-not $pings -or $pings.Count -eq 0) {
+$pingResult = Receive-Job $pingJob -AutoRemoveJob -ErrorAction SilentlyContinue
+
+if ($null -eq $pingResult) {
     Write-FAIL "Ping failed -- host unreachable or ICMP blocked on the path"
     Write-INFO "  UDP may still work if only ICMP is blocked."
     $pingFailed = $true
     $pingIssue  = $true
 } else {
-    $rtts = $pings | ForEach-Object { $_.ResponseTime }
-    $avg  = [Math]::Round(($rtts | Measure-Object -Average).Average, 1)
-    $min  = ($rtts | Measure-Object -Minimum).Minimum
-    $max  = ($rtts | Measure-Object -Maximum).Maximum
-    $recv = $pings.Count
+    Write-OK "Host reachable -- $($pingResult.Count)/3 replies"
+    Write-INFO "  RTT  min=$($pingResult.Min)ms   avg=$($pingResult.Avg)ms   max=$($pingResult.Max)ms"
 
-    Write-OK "Host reachable -- $recv/3 replies"
-    Write-INFO "  RTT  min=${min}ms   avg=${avg}ms   max=${max}ms"
-
-    if ($recv -lt 3)      { Write-WARN "Packet loss: $(3 - $recv)/3 pings dropped"; $pingIssue = $true }
-    if ($avg -le 5)       { Write-OK   "  Latency looks excellent (LAN-grade)" }
-    elseif ($avg -le 30)  { Write-WARN "  Moderate latency (${avg}ms avg)"; $pingIssue = $true }
-    else                  { Write-FAIL "  High latency (${avg}ms avg) -- expect noticeable input lag"; $pingIssue = $true }
+    if ($pingResult.Count -lt 3)    { Write-WARN "Packet loss: $(3 - $pingResult.Count)/3 pings dropped"; $pingIssue = $true }
+    if ($pingResult.Avg -le 5)      { Write-OK   "  Latency looks excellent (LAN-grade)" }
+    elseif ($pingResult.Avg -le 30) { Write-WARN "  Moderate latency ($($pingResult.Avg)ms avg)"; $pingIssue = $true }
+    else                            { Write-FAIL "  High latency ($($pingResult.Avg)ms avg) -- expect noticeable input lag"; $pingIssue = $true }
 }
 
 # =============================================================================
 # 2. LOCAL NETWORK INTERFACE
 # =============================================================================
 Write-Section "2. Local Network Interface"
-
-$allLocalAddresses = Get-NetIPAddress -AddressFamily IPv4 |
-    Where-Object { $_.IPAddress -ne "127.0.0.1" -and $_.PrefixOrigin -ne "WellKnown" }
-if ($relevantIfIndex) {
-    $localAddresses = @($allLocalAddresses | Where-Object { $_.InterfaceIndex -eq $relevantIfIndex })
-    if (-not $localAddresses) { $localAddresses = $allLocalAddresses }
-} else { $localAddresses = $allLocalAddresses }
 
 foreach ($addr in $localAddresses) {
     $adapter     = Get-NetAdapter -InterfaceIndex $addr.InterfaceIndex -ErrorAction SilentlyContinue
@@ -374,10 +402,10 @@ else                 { Write-Host " low (< 1028 bytes)" -ForegroundColor Yellow;
 # 4. UDP CONNECTIVITY TEST
 # =============================================================================
 Write-Section "4. UDP Connectivity Test"
-$udp          = Invoke-UDPTest
-$result5005   = $udp.p5005
-$result5006   = $udp.p5006
-$result5007   = $udp.p5007
+$udp        = Collect-UDPJobs $udpJobs
+$result5005 = $udp.p5005
+$result5006 = $udp.p5006
+$result5007 = $udp.p5007
 
 # -- No-connectivity early warning --------------------------------------------
 if ($pingFailed -and -not ($result5005 -or $result5006 -or $result5007)) {
