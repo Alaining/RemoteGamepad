@@ -317,13 +317,30 @@ if ($Machine -eq "CLIENT") {
     Write-Host "  Client machine at     : $SenderIP"
 }
 
+# -- Start slow network checks in background jobs so they overlap with other steps.
+# Traceroute result is consumed at step 6; MTU result is consumed at step 3.
+$traceJob = Start-Job -ScriptBlock {
+    param($ip)
+    try { Test-NetConnection -ComputerName $ip -TraceRoute -Hops 10 `
+              -WarningAction SilentlyContinue -ErrorAction Stop }
+    catch { $null }
+} -ArgumentList $SenderIP
+
+$mtuJob = Start-Job -ScriptBlock {
+    param($ip)
+    foreach ($size in @(1472, 1000)) {
+        if ((ping.exe -n 1 -f -l $size -w 1000 $ip) -match "Reply from") { return $size }
+    }
+    return 0
+} -ArgumentList $SenderIP
+
 # =============================================================================
 # 1. PING
 # =============================================================================
 Write-Section "1. Ping"
 
-$dt = Start-Dots "Pinging $SenderIP (6 packets)"
-$pings = Test-Connection -ComputerName $SenderIP -Count 6 -ErrorAction SilentlyContinue
+$dt = Start-Dots "Pinging $SenderIP (3 packets)"
+$pings = Test-Connection -ComputerName $SenderIP -Count 3 -ErrorAction SilentlyContinue
 Stop-Dots $dt
 Write-Host ""
 
@@ -339,10 +356,10 @@ if (-not $pings -or $pings.Count -eq 0) {
     $max  = ($rtts | Measure-Object -Maximum).Maximum
     $recv = $pings.Count
 
-    Write-OK "Host reachable -- $recv/6 replies"
+    Write-OK "Host reachable -- $recv/3 replies"
     Write-INFO "  RTT  min=${min}ms   avg=${avg}ms   max=${max}ms"
 
-    if ($recv -lt 6)      { Write-WARN "Packet loss: $(6 - $recv)/6 pings dropped"; $pingIssue = $true }
+    if ($recv -lt 3)      { Write-WARN "Packet loss: $(3 - $recv)/3 pings dropped"; $pingIssue = $true }
     if ($avg -le 5)       { Write-OK   "  Latency looks excellent (LAN-grade)" }
     elseif ($avg -le 30)  { Write-WARN "  Moderate latency (${avg}ms avg)"; $pingIssue = $true }
     else                  { Write-FAIL "  High latency (${avg}ms avg) -- expect noticeable input lag"; $pingIssue = $true }
@@ -405,14 +422,11 @@ foreach ($iface in $relevantIfaces) {
     }
 }
 
-Write-Host -NoNewline "  Testing path MTU" -ForegroundColor Gray
-$pmtuOk = $false
-foreach ($size in @(1472, 1400, 1000)) {
-    Write-Host -NoNewline '.' -ForegroundColor Gray
-    if (ping.exe -n 1 -f -l $size $SenderIP | Select-String "Reply from") { $pmtuOk = $true; break }
-}
-if ($pmtuOk) { Write-Host " OK  (>= $($size + 28) bytes)" -ForegroundColor Green }
-else         { Write-Host " low (< 1028 bytes)" -ForegroundColor Yellow; $mtuIssue = $true }
+$dt = Start-Dots "Testing path MTU"
+$pmtuSize = Receive-Job $mtuJob -Wait -AutoRemoveJob -ErrorAction SilentlyContinue
+Stop-Dots $dt
+if ($pmtuSize -gt 0) { Write-Host " OK  (>= $($pmtuSize + 28) bytes)" -ForegroundColor Green }
+else                 { Write-Host " low (< 1028 bytes)" -ForegroundColor Yellow; $mtuIssue = $true }
 
 # =============================================================================
 # 4. UDP CONNECTIVITY TEST
@@ -470,8 +484,7 @@ if ($Machine -eq "CLIENT") {
 Write-Section "6. Route to Other Machine (up to 10 hops)"
 
 $dt    = Start-Dots "Tracing route to $SenderIP"
-$trace = $null
-try { $trace = Test-NetConnection -ComputerName $SenderIP -TraceRoute -Hops 10 -WarningAction SilentlyContinue -ErrorAction Stop } catch {}
+$trace = Receive-Job $traceJob -Wait -AutoRemoveJob -ErrorAction SilentlyContinue
 Stop-Dots $dt
 Write-Host ""
 
