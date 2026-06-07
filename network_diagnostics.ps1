@@ -325,7 +325,7 @@ Wait-Job $pingJob | Out-Null
 Stop-Dots $dt
 Write-Host ""
 
-$pingResult = Receive-Job $pingJob -AutoRemoveJob -ErrorAction SilentlyContinue
+$pingResult = Receive-Job $pingJob -Wait -AutoRemoveJob -ErrorAction SilentlyContinue
 
 if ($null -eq $pingResult) {
     Write-FAIL "Ping failed -- host unreachable or ICMP blocked on the path"
@@ -546,5 +546,9 @@ if ($tips.Count -gt 0) {
 }
 Write-Host ""
 
-# Exit code used by launch scripts: 0 = all ports passed, 1 = at least one failed.
-if (-not ($result5005 -and $result5006 -and $result5007)) { exit 1 }
+# When ports failed, ask once here so the calling launch script never needs to ask again.
+if (-not ($result5005 -and $result5006 -and $result5007)) {
+    Write-Host ""
+    Write-Host "  Proceed with launch anyway? [Y/N]" -ForegroundColor Yellow
+    if ((Read-Host "  Choice") -notmatch "^[Yy]") { exit 2 }
+}

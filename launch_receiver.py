@@ -29,12 +29,8 @@ try:
 except KeyboardInterrupt:
     print()
     sys.exit(0)
-if diag.returncode == 2:
-    sys.exit(1)   # user already chose to abort inside the diagnostics
 if diag.returncode != 0:
-    answer = input("\nNetwork diagnostics reported issues. Launch anyway? [Y/N]: ").strip()
-    if not answer.lower().startswith("y"):
-        sys.exit(1)
+    sys.exit(1)   # user aborted inside the diagnostics (already asked there)
 
 CREATE_NEW_CONSOLE = 0x00000010
 
