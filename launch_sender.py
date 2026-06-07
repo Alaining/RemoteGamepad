@@ -16,6 +16,16 @@ if "." not in ip:
 python = sys.executable
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
+# Run network diagnostics first (blocking, output shown in this console).
+diag = subprocess.run(
+    ["powershell.exe", "-ExecutionPolicy", "Bypass", "-File",
+     os.path.join(script_dir, "network_diagnostics.ps1"), ip, "SERVER"],
+)
+if diag.returncode != 0:
+    answer = input("\nNetwork diagnostics reported issues. Launch anyway? [Y/N]: ").strip()
+    if not answer.lower().startswith("y"):
+        sys.exit(1)
+
 CREATE_NEW_CONSOLE = 0x00000010
 
 subprocess.Popen(

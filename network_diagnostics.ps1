@@ -544,3 +544,6 @@ if ($tips.Count -gt 0) {
     foreach ($tip in $tips) { Write-Host "    * $tip" }
 }
 Write-Host ""
+
+# Exit code used by launch scripts: 0 = all ports passed, 1 = at least one failed.
+if (-not ($result5005 -and $result5006 -and $result5007)) { exit 1 }
