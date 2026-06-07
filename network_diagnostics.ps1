@@ -33,8 +33,6 @@ $ACK_PORT        = 5007   # server binds (latency ACKs from client)
 # UDP test timeout: 15s normally; -Wait makes it effectively unlimited (~24 days).
 $TIMEOUT_MS   = if ($Wait) { [Int32]::MaxValue } else { 15000 }
 $timeoutLabel = if ($Wait) { 'unlimited' }       else { '15s'  }
-$DIAG = [System.Text.Encoding]::ASCII.GetBytes("DIAG")
-$PONG = [System.Text.Encoding]::ASCII.GetBytes("PONG")
 
 # -- Issue flags --------------------------------------------------------------
 $pingFailed = $false   # true only when host is completely unreachable (not just slow)
@@ -134,12 +132,55 @@ function Invoke-CreateFirewallRule([int]$port, [string]$label) {
 }
 
 # Runs the UDP connectivity test. Returns @{ p5005; p5006; p5007 } booleans.
-# Can be called from step 4 and again from the summary after rule creation.
-# All sockets use a 2-second ReceiveTimeout slice so CTRL+C is honoured within ~2s.
-# CLIENT retries probes every 2s so either side can be started first.
+# All 3 port tests run as parallel background jobs so worst-case time is
+# 1 × $TIMEOUT_MS instead of 3 × $TIMEOUT_MS.
 function Invoke-UDPTest {
     $p5005 = $false; $p5006 = $false; $p5007 = $false
-    $cIP   = $SenderIP   # overwritten on SERVER once first packet arrives
+
+    # Job: bind $port, echo PONG to the first probe that arrives.
+    $receiveScript = {
+        param([int]$port, [int]$timeout)
+        $pong = [System.Text.Encoding]::ASCII.GetBytes("PONG")
+        $s    = $null
+        try {
+            $s = New-Object System.Net.Sockets.UdpClient
+            $s.Client.Bind([System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, $port))
+            $s.Client.ReceiveTimeout = 2000
+            $ep       = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
+            $deadline = [DateTime]::UtcNow.AddMilliseconds($timeout)
+            while ([DateTime]::UtcNow -lt $deadline) {
+                try {
+                    $null = $s.Receive([ref]$ep)
+                    $s.Send($pong, $pong.Length, $ep) | Out-Null
+                    return $true
+                } catch { }
+            }
+        } catch { }
+        finally { if ($s) { $s.Close() } }
+        return $false
+    }
+
+    # Job: send DIAG to $ip:$port every 2s, return $true when PONG is received.
+    $probeScript = {
+        param([string]$ip, [int]$port, [int]$timeout)
+        $diag = [System.Text.Encoding]::ASCII.GetBytes("DIAG")
+        $s    = $null
+        try {
+            $s = New-Object System.Net.Sockets.UdpClient
+            $s.Client.ReceiveTimeout = 2000
+            $ep       = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
+            $deadline = [DateTime]::UtcNow.AddMilliseconds($timeout)
+            while ([DateTime]::UtcNow -lt $deadline) {
+                try {
+                    $s.Send($diag, $diag.Length, $ip, $port) | Out-Null
+                    $null = $s.Receive([ref]$ep)
+                    return $true
+                } catch { }
+            }
+        } catch { }
+        finally { if ($s) { $s.Close() } }
+        return $false
+    }
 
     if ($Machine -eq "SERVER") {
         $thisIP = if ($localAddresses) { $localAddresses[0].IPAddress } else { "?" }
@@ -148,140 +189,41 @@ function Invoke-UDPTest {
         Write-Host "      .\network_diagnostics.ps1 $thisIP CLIENT" -ForegroundColor White
         Write-Host ""
 
-        $s5005 = $null
-        try {
-            $s5005 = New-Object System.Net.Sockets.UdpClient
-            $s5005.Client.Bind([System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, $CONTROLLER_PORT))
-            $s5005.Client.ReceiveTimeout = 2000
-        } catch { Write-WARN "Cannot bind UDP $CONTROLLER_PORT -- controller_udp_receiver.py may be running" }
-
-        $s5007 = $null
-        try {
-            $s5007 = New-Object System.Net.Sockets.UdpClient
-            $s5007.Client.Bind([System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, $ACK_PORT))
-            $s5007.Client.ReceiveTimeout = 2000
-        } catch { Write-WARN "Cannot bind UDP $ACK_PORT -- port may already be in use" }
-
-        if ($s5005) {
-            $dt = Start-Dots "Waiting for client probe on UDP $CONTROLLER_PORT ($timeoutLabel)"
-            $ep5005  = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
-            $deadline = [DateTime]::UtcNow.AddMilliseconds($TIMEOUT_MS)
-            try {
-                while ([DateTime]::UtcNow -lt $deadline) {
-                    try {
-                        $null = $s5005.Receive([ref]$ep5005)
-                        $cIP = $ep5005.Address.ToString()
-                        $s5005.Send($PONG, $PONG.Length, $ep5005) | Out-Null
-                        $p5005 = $true; break
-                    } catch { }
-                }
-            } finally { $s5005.Close() }
-            Stop-Dots $dt
-            if ($p5005) { Write-Host " [OK]  probe from $cIP" -ForegroundColor Green }
-            else        { Write-Host " [TIMEOUT]" -ForegroundColor Red }
-        }
-
-        if ($s5007) {
-            $dt = Start-Dots "Waiting for client probe on UDP $ACK_PORT ($timeoutLabel)"
-            $ep5007  = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
-            $deadline = [DateTime]::UtcNow.AddMilliseconds($TIMEOUT_MS)
-            try {
-                while ([DateTime]::UtcNow -lt $deadline) {
-                    try {
-                        $null = $s5007.Receive([ref]$ep5007)
-                        $s5007.Send($PONG, $PONG.Length, $ep5007) | Out-Null
-                        $p5007 = $true; break
-                    } catch { }
-                }
-            } finally { $s5007.Close() }
-            Stop-Dots $dt
-            if ($p5007) { Write-Host " [OK]" -ForegroundColor Green }
-            else        { Write-Host " [TIMEOUT]" -ForegroundColor Red }
-        }
-
-        $dt   = Start-Dots "Probing client UDP $VIDEO_PORT at $cIP ($timeoutLabel)"
-        $sock = New-Object System.Net.Sockets.UdpClient
-        $sock.Client.ReceiveTimeout = 2000
-        $ep   = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
-        $deadline = [DateTime]::UtcNow.AddMilliseconds($TIMEOUT_MS)
-        try {
-            while ([DateTime]::UtcNow -lt $deadline) {
-                try {
-                    $sock.Send($DIAG, $DIAG.Length, $cIP, $VIDEO_PORT) | Out-Null
-                    $null = $sock.Receive([ref]$ep)
-                    $p5006 = $true; break
-                } catch { }
-            }
-        } finally { $sock.Close() }
-        Stop-Dots $dt
-        if ($p5006) { Write-Host " [OK]  client replied" -ForegroundColor Green }
-        else        { Write-Host " [TIMEOUT]" -ForegroundColor Red }
-
+        $j5005 = Start-Job $receiveScript -ArgumentList $CONTROLLER_PORT, $TIMEOUT_MS
+        $j5007 = Start-Job $receiveScript -ArgumentList $ACK_PORT,        $TIMEOUT_MS
+        $j5006 = Start-Job $probeScript   -ArgumentList $SenderIP, $VIDEO_PORT, $TIMEOUT_MS
     } else {
-        # Pre-bind 5006 so the OS buffers any server probe that arrives while
-        # we are still running the 5005/5007 steps below.
-        $s5006 = $null
-        try {
-            $s5006 = New-Object System.Net.Sockets.UdpClient
-            $s5006.Client.Bind([System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, $VIDEO_PORT))
-            $s5006.Client.ReceiveTimeout = 2000
-        } catch { Write-WARN "Cannot bind UDP $VIDEO_PORT -- video_receiver.py may already be running" }
+        # Start the 5006 receive job first so the OS begins buffering any probe
+        # that arrives from the server before the job has fully initialised.
+        $j5006 = Start-Job $receiveScript -ArgumentList $VIDEO_PORT, $TIMEOUT_MS
+        $j5005 = Start-Job $probeScript   -ArgumentList $SenderIP, $CONTROLLER_PORT, $TIMEOUT_MS
+        $j5007 = Start-Job $probeScript   -ArgumentList $SenderIP, $ACK_PORT,        $TIMEOUT_MS
+    }
 
-        # Retry loop: resend DIAG every 2s so the test works regardless of which
-        # side started first.
-        $dt   = Start-Dots "Probing server UDP $CONTROLLER_PORT at $SenderIP ($timeoutLabel)"
-        $sock = New-Object System.Net.Sockets.UdpClient
-        $sock.Client.ReceiveTimeout = 2000
-        $ep   = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
-        $deadline = [DateTime]::UtcNow.AddMilliseconds($TIMEOUT_MS)
-        try {
-            while ([DateTime]::UtcNow -lt $deadline) {
-                try {
-                    $sock.Send($DIAG, $DIAG.Length, $SenderIP, $CONTROLLER_PORT) | Out-Null
-                    $null = $sock.Receive([ref]$ep)
-                    $p5005 = $true; break
-                } catch { }
-            }
-        } finally { $sock.Close() }
-        Stop-Dots $dt
-        if ($p5005) { Write-Host " [OK]  server $($ep.Address) replied" -ForegroundColor Green }
-        else        { Write-Host " [TIMEOUT]" -ForegroundColor Red }
+    $dt = Start-Dots "Testing all 3 UDP ports in parallel ($timeoutLabel)"
+    Wait-Job $j5005, $j5007, $j5006 | Out-Null
+    Stop-Dots $dt
+    Write-Host ""
 
-        $dt   = Start-Dots "Probing server UDP $ACK_PORT at $SenderIP ($timeoutLabel)"
-        $sock = New-Object System.Net.Sockets.UdpClient
-        $sock.Client.ReceiveTimeout = 2000
-        $ep   = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
-        $deadline = [DateTime]::UtcNow.AddMilliseconds($TIMEOUT_MS)
-        try {
-            while ([DateTime]::UtcNow -lt $deadline) {
-                try {
-                    $sock.Send($DIAG, $DIAG.Length, $SenderIP, $ACK_PORT) | Out-Null
-                    $null = $sock.Receive([ref]$ep)
-                    $p5007 = $true; break
-                } catch { }
-            }
-        } finally { $sock.Close() }
-        Stop-Dots $dt
-        if ($p5007) { Write-Host " [OK]  server $($ep.Address) replied" -ForegroundColor Green }
-        else        { Write-Host " [TIMEOUT]" -ForegroundColor Red }
+    $p5005 = [bool](Receive-Job $j5005 -ErrorAction SilentlyContinue)
+    $p5007 = [bool](Receive-Job $j5007 -ErrorAction SilentlyContinue)
+    $p5006 = [bool](Receive-Job $j5006 -ErrorAction SilentlyContinue)
+    Remove-Job $j5005, $j5007, $j5006 -Force -ErrorAction SilentlyContinue
 
-        if ($s5006) {
-            $dt = Start-Dots "Waiting for server probe on UDP $VIDEO_PORT ($timeoutLabel)"
-            $ep5006  = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
-            $deadline = [DateTime]::UtcNow.AddMilliseconds($TIMEOUT_MS)
-            try {
-                while ([DateTime]::UtcNow -lt $deadline) {
-                    try {
-                        $null = $s5006.Receive([ref]$ep5006)
-                        $s5006.Send($PONG, $PONG.Length, $ep5006) | Out-Null
-                        $p5006 = $true; break
-                    } catch { }
-                }
-            } finally { $s5006.Close() }
-            Stop-Dots $dt
-            if ($p5006) { Write-Host " [OK]  probe from $($ep5006.Address)" -ForegroundColor Green }
-            else        { Write-Host " [TIMEOUT]" -ForegroundColor Red }
-        }
+    if ($Machine -eq "SERVER") {
+        if ($p5005) { Write-OK   "5005/UDP  controller data  SERVER <-- client" }
+        else        { Write-FAIL "5005/UDP  controller data  SERVER <-- client  [TIMEOUT]" }
+        if ($p5007) { Write-OK   "5007/UDP  latency ACKs     SERVER <-- client" }
+        else        { Write-FAIL "5007/UDP  latency ACKs     SERVER <-- client  [TIMEOUT]" }
+        if ($p5006) { Write-OK   "5006/UDP  video frames     SERVER --> client" }
+        else        { Write-FAIL "5006/UDP  video frames     SERVER --> client  [TIMEOUT]" }
+    } else {
+        if ($p5005) { Write-OK   "5005/UDP  controller data  CLIENT --> server" }
+        else        { Write-FAIL "5005/UDP  controller data  CLIENT --> server  [TIMEOUT]" }
+        if ($p5007) { Write-OK   "5007/UDP  latency ACKs     CLIENT --> server" }
+        else        { Write-FAIL "5007/UDP  latency ACKs     CLIENT --> server  [TIMEOUT]" }
+        if ($p5006) { Write-OK   "5006/UDP  video frames     CLIENT <-- server" }
+        else        { Write-FAIL "5006/UDP  video frames     CLIENT <-- server  [TIMEOUT]" }
     }
 
     return @{ p5005 = $p5005; p5006 = $p5006; p5007 = $p5007 }
