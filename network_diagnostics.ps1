@@ -14,23 +14,30 @@
     IP address of the other machine. If omitted, you will be prompted.
 .PARAMETER Machine
     Which machine this is: CLIENT or SERVER. If omitted, you will be prompted.
+.PARAMETER Wait
+    Wait indefinitely for the other machine instead of timing out after 15 seconds.
+    Useful when both machines start the diagnostic at very different times.
 .EXAMPLE
     .\network_diagnostics.ps1                           # prompts for both
     .\network_diagnostics.ps1 192.168.1.50 CLIENT
     .\network_diagnostics.ps1 192.168.1.50 SERVER
+    .\network_diagnostics.ps1 192.168.1.50 SERVER -Wait
 #>
 
-param([string]$SenderIP, [string]$Machine)
+param([string]$SenderIP, [string]$Machine, [switch]$Wait)
 
 # -- Ports --------------------------------------------------------------------
 $CONTROLLER_PORT = 5005   # server binds (controller data from client)
 $VIDEO_PORT      = 5006   # client binds (video from server)
 $ACK_PORT        = 5007   # server binds (latency ACKs from client)
-$TIMEOUT_MS      = 60000  # 1 minute for all UDP connectivity tests
+# UDP test timeout: 15s normally; -Wait makes it effectively unlimited (~24 days).
+$TIMEOUT_MS   = if ($Wait) { [Int32]::MaxValue } else { 15000 }
+$timeoutLabel = if ($Wait) { 'unlimited' }       else { '15s'  }
 $DIAG = [System.Text.Encoding]::ASCII.GetBytes("DIAG")
 $PONG = [System.Text.Encoding]::ASCII.GetBytes("PONG")
 
 # -- Issue flags --------------------------------------------------------------
+$pingFailed = $false   # true only when host is completely unreachable (not just slow)
 $pingIssue  = $false
 $mtuIssue   = $false
 $routeIssue = $false
@@ -156,7 +163,7 @@ function Invoke-UDPTest {
         } catch { Write-WARN "Cannot bind UDP $ACK_PORT -- port may already be in use" }
 
         if ($s5005) {
-            $dt = Start-Dots "Waiting for client probe on UDP $CONTROLLER_PORT (1 min)"
+            $dt = Start-Dots "Waiting for client probe on UDP $CONTROLLER_PORT ($timeoutLabel)"
             $ep5005  = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
             $deadline = [DateTime]::UtcNow.AddMilliseconds($TIMEOUT_MS)
             try {
@@ -175,7 +182,7 @@ function Invoke-UDPTest {
         }
 
         if ($s5007) {
-            $dt = Start-Dots "Waiting for client probe on UDP $ACK_PORT (1 min)"
+            $dt = Start-Dots "Waiting for client probe on UDP $ACK_PORT ($timeoutLabel)"
             $ep5007  = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
             $deadline = [DateTime]::UtcNow.AddMilliseconds($TIMEOUT_MS)
             try {
@@ -192,7 +199,7 @@ function Invoke-UDPTest {
             else        { Write-Host " [TIMEOUT]" -ForegroundColor Red }
         }
 
-        $dt   = Start-Dots "Probing client UDP $VIDEO_PORT at $cIP (1 min)"
+        $dt   = Start-Dots "Probing client UDP $VIDEO_PORT at $cIP ($timeoutLabel)"
         $sock = New-Object System.Net.Sockets.UdpClient
         $sock.Client.ReceiveTimeout = 2000
         $ep   = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
@@ -222,7 +229,7 @@ function Invoke-UDPTest {
 
         # Retry loop: resend DIAG every 2s so the test works regardless of which
         # side started first.
-        $dt   = Start-Dots "Probing server UDP $CONTROLLER_PORT at $SenderIP (1 min)"
+        $dt   = Start-Dots "Probing server UDP $CONTROLLER_PORT at $SenderIP ($timeoutLabel)"
         $sock = New-Object System.Net.Sockets.UdpClient
         $sock.Client.ReceiveTimeout = 2000
         $ep   = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
@@ -240,7 +247,7 @@ function Invoke-UDPTest {
         if ($p5005) { Write-Host " [OK]  server $($ep.Address) replied" -ForegroundColor Green }
         else        { Write-Host " [TIMEOUT]" -ForegroundColor Red }
 
-        $dt   = Start-Dots "Probing server UDP $ACK_PORT at $SenderIP (1 min)"
+        $dt   = Start-Dots "Probing server UDP $ACK_PORT at $SenderIP ($timeoutLabel)"
         $sock = New-Object System.Net.Sockets.UdpClient
         $sock.Client.ReceiveTimeout = 2000
         $ep   = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
@@ -259,7 +266,7 @@ function Invoke-UDPTest {
         else        { Write-Host " [TIMEOUT]" -ForegroundColor Red }
 
         if ($s5006) {
-            $dt = Start-Dots "Waiting for server probe on UDP $VIDEO_PORT (1 min)"
+            $dt = Start-Dots "Waiting for server probe on UDP $VIDEO_PORT ($timeoutLabel)"
             $ep5006  = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
             $deadline = [DateTime]::UtcNow.AddMilliseconds($TIMEOUT_MS)
             try {
@@ -323,7 +330,8 @@ Write-Host ""
 if (-not $pings -or $pings.Count -eq 0) {
     Write-FAIL "Ping failed -- host unreachable or ICMP blocked on the path"
     Write-INFO "  UDP may still work if only ICMP is blocked."
-    $pingIssue = $true
+    $pingFailed = $true
+    $pingIssue  = $true
 } else {
     $rtts = $pings | ForEach-Object { $_.ResponseTime }
     $avg  = [Math]::Round(($rtts | Measure-Object -Average).Average, 1)
@@ -414,6 +422,16 @@ $udp          = Invoke-UDPTest
 $result5005   = $udp.p5005
 $result5006   = $udp.p5006
 $result5007   = $udp.p5007
+
+# -- No-connectivity early warning --------------------------------------------
+if ($pingFailed -and -not ($result5005 -or $result5006 -or $result5007)) {
+    $target = if ($Machine -eq "CLIENT") { "SERVER" } else { "CLIENT" }
+    Write-Host ""
+    Write-FAIL "No connectivity to the $target machine at $SenderIP -- ping and all UDP tests failed."
+    Write-INFO "  Possible causes: wrong IP, machine is offline, or firewall is blocking everything."
+    Write-Host "  Continue to summary anyway? [Y/N]" -ForegroundColor Yellow
+    if ((Read-Host "  Choice") -notmatch "^[Yy]") { exit 2 }
+}
 
 # =============================================================================
 # 5. PORT AVAILABILITY

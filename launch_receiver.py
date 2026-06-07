@@ -2,8 +2,10 @@ import subprocess
 import sys
 import os
 
-if len(sys.argv) > 1:
-    ip = sys.argv[1].strip()
+wait_mode = "--wait" in sys.argv
+ip_args   = [a for a in sys.argv[1:] if a != "--wait"]
+if ip_args:
+    ip = ip_args[0].strip()
 else:
     ip = input("Enter the server's IP address: ").strip()
 if not ip:
@@ -17,10 +19,12 @@ python = sys.executable
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
 # Run network diagnostics first (blocking, output shown in this console).
-diag = subprocess.run(
-    ["powershell.exe", "-ExecutionPolicy", "Bypass", "-File",
-     os.path.join(script_dir, "network_diagnostics.ps1"), ip, "CLIENT"],
-)
+# Pass -Wait to let the diagnostics wait indefinitely for the other machine.
+diag_cmd = ["powershell.exe", "-ExecutionPolicy", "Bypass", "-File",
+            os.path.join(script_dir, "network_diagnostics.ps1"), ip, "CLIENT"]
+if wait_mode:
+    diag_cmd.append("-Wait")
+diag = subprocess.run(diag_cmd)
 if diag.returncode != 0:
     answer = input("\nNetwork diagnostics reported issues. Launch anyway? [Y/N]: ").strip()
     if not answer.lower().startswith("y"):
