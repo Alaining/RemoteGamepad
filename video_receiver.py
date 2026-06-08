@@ -17,6 +17,8 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 2 — Constants
 # ─────────────────────────────────────────────────────────────────────────────
+_sender_ip = sys.argv[1] if len(sys.argv) > 1 else None
+
 UDP_PORT = 5006
 ACK_PORT = 5007              # server listens here for latency ACKs
 HEARTBEAT_INTERVAL = 2.0     # seconds between heartbeats sent to server when idle
@@ -36,6 +38,9 @@ sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)  # 1MB: must f
 sock.bind(("0.0.0.0", UDP_PORT))
 sock.settimeout(0.1)  # short timeout so heartbeat and quit checks run even when idle
 print(f"Listening on port {UDP_PORT}... (press Q or close the window to quit)")
+if not _sender_ip:
+    print(f"Tip: pass the sender's IP as an argument to punch a NAT hole at startup.")
+    print(f"     e.g.  python video_receiver.py 1.2.3.4")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 4 — pygame window and font setup
@@ -71,6 +76,18 @@ while True:
     except (BlockingIOError, OSError):
         break
 sock.settimeout(0.1)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 6b — NAT hole punch
+#   Sends HELO from sock (bound to port 5006) to the sender's ACK port so the
+#   router creates a mapping that lets the sender's video packets reach us.
+#   Works for full-cone and address-restricted NATs; port-restricted NATs still
+#   require explicit port forwarding on the receiver's router.
+# ─────────────────────────────────────────────────────────────────────────────
+if _sender_ip:
+    for _ in range(3):
+        sock.sendto(b'HELO', (_sender_ip, ACK_PORT))
+    print(f"NAT hole punched: port {UDP_PORT} → {_sender_ip}:{ACK_PORT}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 7 — Event helper
