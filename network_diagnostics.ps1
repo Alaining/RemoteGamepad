@@ -521,7 +521,8 @@ if ($Machine -eq "CLIENT") {
         Write-Host "  Create inbound allow rules for the failed ports on this machine? [Y/N]" -ForegroundColor Yellow
         if ((Read-Host "  Choice") -match "^[Yy]") {
             foreach ($p in $failedLocal) {
-                Invoke-CreateFirewallRule -port $p -label (if ($p -eq $CONTROLLER_PORT) { "Controller Data" } else { "Latency ACKs" }) | Out-Null
+                $label = if ($p -eq $CONTROLLER_PORT) { "Controller Data" } else { "Latency ACKs" }
+                Invoke-CreateFirewallRule -port $p -label $label | Out-Null
             }
             Write-Section "4. UDP Connectivity Test (re-run)"
             $udp        = Invoke-UDPTest
