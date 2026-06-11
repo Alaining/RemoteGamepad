@@ -205,10 +205,16 @@ print("Run video_receiver.py on the client to watch.\n")
 # ─────────────────────────────────────────────────────────────────────────────
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 256 * 1024)  # large enough for one full-quality frame; too small caused sendto() to block on WiFi
+sock.bind(("0.0.0.0", UDP_PORT))  # fixed source port so receiver's HELO hole-punch covers our video traffic
 
 ack_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # separate socket so ACK reads never interfere with frame sends
 ack_sock.bind(("0.0.0.0", ACK_PORT))
 ack_sock.settimeout(ACK_TIMEOUT)
+
+# video_dest: the actual destination for frame packets.
+# On LAN this equals (ip, UDP_PORT).  Over the internet the receiver's HELO
+# reveals its NAT-mapped external port, which we must use instead.
+video_dest = (ip, UDP_PORT)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 10 — Latency metric state
@@ -359,7 +365,7 @@ try:
                     header = struct.pack(">IQH", seq & 0xFFFFFFFF, t_frame_ready,
                                          max(0, min(65535, int(_e2e_send_ms))))
                     t0 = time.perf_counter_ns()
-                    sock.sendto(header + latest_frame, (ip, UDP_PORT))
+                    sock.sendto(header + latest_frame, video_dest)
                     t1 = time.perf_counter_ns()
                     _snd.append((t1 - t0) / 1e6)
                     _fsz.append(len(latest_frame))
@@ -414,6 +420,18 @@ try:
                         _rtt.append((t_stages[2] - t0) / 1e6)
                         if t_enc_start is not None:
                             _total.append((t_stages[2] - t_enc_start) / 1e6)
+
+                    # Check for HELO from receiver (non-blocking) and update the video
+                    # destination to the receiver's NAT-mapped external address.
+                    sock.setblocking(False)
+                    try:
+                        helo_data, helo_addr = sock.recvfrom(16)
+                        if helo_data == b'HELO' and helo_addr != video_dest:
+                            video_dest = helo_addr
+                            print(f"\nReceiver at {helo_addr[0]}:{helo_addr[1]} — updating video destination.")
+                    except (BlockingIOError, OSError):
+                        pass
+                    sock.setblocking(True)
 
                     t_prev_done = time.perf_counter_ns()  # mark end of this frame; next Encode is measured from here
                     seq += 1

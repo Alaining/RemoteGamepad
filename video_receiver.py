@@ -86,8 +86,8 @@ sock.settimeout(0.1)
 # ─────────────────────────────────────────────────────────────────────────────
 if _sender_ip:
     for _ in range(3):
-        sock.sendto(b'HELO', (_sender_ip, ACK_PORT))
-    print(f"NAT hole punched: port {UDP_PORT} → {_sender_ip}:{ACK_PORT}")
+        sock.sendto(b'HELO', (_sender_ip, UDP_PORT))
+    print(f"NAT hole punched: {UDP_PORT} → {_sender_ip}:{UDP_PORT}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 7 — Event helper
@@ -120,7 +120,7 @@ try:
             if known_ack_addr is not None:
                 _now = time.perf_counter()
                 if _now - max(last_frame_time, last_heartbeat_time) >= HEARTBEAT_INTERVAL:
-                    sock.sendto(b'HELO', known_ack_addr)
+                    sock.sendto(b'HELO', (known_ack_addr[0], UDP_PORT))
                     last_heartbeat_time = _now
             if pump_events():
                 break
