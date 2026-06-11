@@ -103,13 +103,6 @@ Write-OK "Packages installed."
 Set-Content -Path "$INSTALL_DIR\Launch Server.bat" -Encoding ASCII -Value "@echo off
 start `"`" `"$INSTALL_DIR\.venv\Scripts\pythonw.exe`" `"$INSTALL_DIR\launch_server.py`""
 
-# Client: keep console + pause so output is visible
-Set-Content -Path "$INSTALL_DIR\Launch Client.bat" -Encoding ASCII -Value "@echo off
-cd /d `"$INSTALL_DIR`"
-call .venv\Scripts\activate.bat
-python launch_client.py
-pause"
-
 # --- Launcher batch file (Network Diagnostics) ---
 Set-Content -Path "$INSTALL_DIR\Network Diagnostics.bat" -Encoding ASCII -Value "@echo off
 cd /d `"$INSTALL_DIR`"

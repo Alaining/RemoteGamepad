@@ -6,7 +6,6 @@ $FILES = @(
     "sender_gui.py",
     "server_gui.py",
     "launch_server.py",
-    "launch_client.py",
     "controller_udp_sender.py",
     "controller_udp_receiver.py",
     "video_udp_sender.py",
