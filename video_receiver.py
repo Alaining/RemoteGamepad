@@ -86,8 +86,9 @@ sock.settimeout(0.1)
 # ─────────────────────────────────────────────────────────────────────────────
 if _sender_ip:
     for _ in range(3):
-        sock.sendto(b'HELO', (_sender_ip, UDP_PORT))
-    print(f"NAT hole punched: {UDP_PORT} → {_sender_ip}:{UDP_PORT}")
+        sock.sendto(b'HELO', (_sender_ip, UDP_PORT))   # sender's video port
+        sock.sendto(b'HELO', (_sender_ip, ACK_PORT))  # sender's ACK port (fallback if 5006 is firewalled)
+    print(f"NAT hole punched → {_sender_ip}:{UDP_PORT} and :{ACK_PORT}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 7 — Event helper
@@ -119,13 +120,10 @@ try:
         except socket.timeout:
             _now = time.perf_counter()
             if _now - max(last_frame_time, last_heartbeat_time) >= HEARTBEAT_INTERVAL:
-                if known_ack_addr is not None:
-                    sock.sendto(b'HELO', (known_ack_addr[0], UDP_PORT))
-                    last_heartbeat_time = _now
-                elif _sender_ip:
-                    # No frame received yet — keep punching the NAT hole so the
-                    # sender can discover our external address once it's ready.
-                    sock.sendto(b'HELO', (_sender_ip, UDP_PORT))
+                _helo_ip = known_ack_addr[0] if known_ack_addr is not None else _sender_ip
+                if _helo_ip:
+                    sock.sendto(b'HELO', (_helo_ip, UDP_PORT))   # sender's video port
+                    sock.sendto(b'HELO', (_helo_ip, ACK_PORT))  # sender's ACK port (firewall fallback)
                     last_heartbeat_time = _now
             if pump_events():
                 break

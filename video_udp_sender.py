@@ -4,6 +4,7 @@
 import subprocess              # spawn ffmpeg as a child process and read its stdout pipe
 import sys
 import socket
+import select                  # wait on multiple sockets simultaneously (startup HELO wait)
 import struct                  # pack/unpack the binary frame header (seq + timestamp_ns)
 import time
 import msvcrt                  # Windows-only: convert a Python file object to a Win32 HANDLE
@@ -211,26 +212,45 @@ ack_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # separate socket s
 ack_sock.bind(("0.0.0.0", ACK_PORT))
 ack_sock.settimeout(ACK_TIMEOUT)
 
+# Best-effort: open port UDP_PORT in Windows Firewall so HELO packets from the
+# internet receiver can reach this process.  Silently skipped if not admin or
+# the rule already exists.
+try:
+    subprocess.run(
+        ["netsh", "advfirewall", "firewall", "add", "rule",
+         "name=RemoteGamepad-Video", "protocol=UDP", "dir=in",
+         f"localport={UDP_PORT}", "action=allow"],
+        check=False, capture_output=True,
+    )
+except Exception:
+    pass
+
 # video_dest: the actual destination for frame packets.
 # On LAN this equals (ip, UDP_PORT).  Over the internet the receiver's HELO
 # reveals its NAT-mapped external port, which we must use instead.
 video_dest = (ip, UDP_PORT)
 
-# Over the internet the receiver must punch a NAT hole (by sending HELO here)
-# before frames can reach it.  Wait briefly so video_dest is set correctly
-# before the first frame goes out.  On LAN, no HELO arrives and we proceed.
+# Wait for the receiver's startup HELO on either socket (video port 5006 or
+# ACK port 5007) — the receiver sends to both so whichever is open in the
+# sender's firewall wins.  Proceed immediately once any HELO arrives.
 print("Waiting up to 5 s for receiver to connect...")
-sock.settimeout(5.0)
-try:
-    while True:
-        _d, _a = sock.recvfrom(16)
-        if _d == b'HELO':
-            video_dest = _a
-            print(f"Receiver connected from {_a[0]}:{_a[1]}")
-            break
-except socket.timeout:
-    print(f"No HELO yet; streaming to {ip}:{UDP_PORT} (fine for LAN, or receiver will connect shortly).")
-sock.settimeout(None)
+_deadline = time.perf_counter() + 5.0
+_connected = False
+while time.perf_counter() < _deadline and not _connected:
+    _rem = max(0.0, _deadline - time.perf_counter())
+    _ready, _, _ = select.select([sock, ack_sock], [], [], _rem)
+    for _s in _ready:
+        try:
+            _d, _a = _s.recvfrom(256)
+            if _d == b'HELO':
+                video_dest = _a
+                print(f"Receiver connected from {_a[0]}:{_a[1]}")
+                _connected = True
+                break
+        except Exception:
+            pass
+if not _connected:
+    print(f"No HELO in 5 s; streaming to {ip}:{UDP_PORT} (fine for LAN, or receiver connects later).")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 10 — Latency metric state
@@ -391,10 +411,15 @@ try:
                     # Discard any ACKs left over from a previously timed-out frame.
                     # Without this, an old ACK arriving just now could be mistaken for
                     # a stage-0 ACK of the frame we just sent.
+                    # Also handle HELO packets that arrive here on ack_sock (port 5007)
+                    # when the receiver can reach that port but not the video port (5006).
                     ack_sock.setblocking(False)
                     while True:
                         try:
-                            ack_sock.recvfrom(13)
+                            _drain_data, _drain_addr = ack_sock.recvfrom(256)
+                            if _drain_data == b'HELO' and _drain_addr != video_dest:
+                                video_dest = _drain_addr
+                                print(f"\nReceiver at {_drain_addr[0]}:{_drain_addr[1]} (via ACK port)")
                         except Exception:
                             break
                     ack_sock.settimeout(ACK_TIMEOUT)
@@ -407,7 +432,12 @@ try:
                     t_stages = {}
                     for _ in range(2):
                         try:
-                            data, _ = ack_sock.recvfrom(13)
+                            data, _ack_addr = ack_sock.recvfrom(256)
+                            if data == b'HELO':
+                                if _ack_addr != video_dest:
+                                    video_dest = _ack_addr
+                                    print(f"\nReceiver at {_ack_addr[0]}:{_ack_addr[1]} (via ACK port)")
+                                continue  # not an ACK stage — keep waiting
                             if len(data) == 13:
                                 ack_seq, _, stage = struct.unpack(">IQB", data)
                                 if ack_seq == (seq & 0xFFFFFFFF):
@@ -417,8 +447,12 @@ try:
                             break
                     ack_sock.setblocking(False)
                     try:
-                        data, _ = ack_sock.recvfrom(13)
-                        if len(data) == 13:
+                        data, _ack_addr = ack_sock.recvfrom(256)
+                        if data == b'HELO':
+                            if _ack_addr != video_dest:
+                                video_dest = _ack_addr
+                                print(f"\nReceiver at {_ack_addr[0]}:{_ack_addr[1]} (via ACK port)")
+                        elif len(data) == 13:
                             ack_seq, _, stage = struct.unpack(">IQB", data)
                             if ack_seq == (seq & 0xFFFFFFFF) and stage == 2:
                                 t_stages[2] = time.perf_counter_ns()
