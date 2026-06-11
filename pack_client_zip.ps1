@@ -4,6 +4,7 @@ $FILES = @(
     "Install RemoteGamepad.bat",
     "_setup.ps1",
     "sender_gui.py",
+    "server_gui.py",
     "launch_server.py",
     "launch_client.py",
     "controller_udp_sender.py",
