@@ -98,19 +98,17 @@ try {
 Write-OK "Packages installed."
 
 # --- Launcher batch files (Python scripts) ---
-$pyLaunchers = @{
-    "Launch Server.bat" = "launch_server.py"
-    "Launch Client.bat" = "launch_client.py"
-}
 
-foreach ($bat in $pyLaunchers.Keys) {
-    $pyScript = $pyLaunchers[$bat]
-    Set-Content -Path "$INSTALL_DIR\$bat" -Encoding ASCII -Value "@echo off
+# Server: use pythonw so no console window appears
+Set-Content -Path "$INSTALL_DIR\Launch Server.bat" -Encoding ASCII -Value "@echo off
+start `"`" `"$INSTALL_DIR\.venv\Scripts\pythonw.exe`" `"$INSTALL_DIR\launch_server.py`""
+
+# Client: keep console + pause so output is visible
+Set-Content -Path "$INSTALL_DIR\Launch Client.bat" -Encoding ASCII -Value "@echo off
 cd /d `"$INSTALL_DIR`"
 call .venv\Scripts\activate.bat
-python $pyScript
+python launch_client.py
 pause"
-}
 
 # --- Launcher batch file (Network Diagnostics) ---
 Set-Content -Path "$INSTALL_DIR\Network Diagnostics.bat" -Encoding ASCII -Value "@echo off
