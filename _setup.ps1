@@ -115,7 +115,6 @@ $desktop = [System.Environment]::GetFolderPath("Desktop")
 
 $shortcuts = @{
     "RemoteGamepad - Launch Server"       = "Launch Server.bat"
-    "RemoteGamepad - Launch Client"       = "Launch Client.bat"
     "RemoteGamepad - Network Diagnostics" = "Network Diagnostics.bat"
 }
 
@@ -138,3 +137,6 @@ foreach ($name in $shortcuts.Keys) {
     Write-Host "    - $name" -ForegroundColor White
 }
 Write-Host ""
+Write-Host "  Press any key to open RemoteGamepad..." -ForegroundColor Green
+$null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+Start-Process "$INSTALL_DIR\.venv\Scripts\pythonw.exe" -ArgumentList "`"$INSTALL_DIR\server_gui.py`""
