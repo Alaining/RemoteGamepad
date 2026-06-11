@@ -249,7 +249,7 @@ class BatchedProcessTab(ProcessTab):
 class ServerGUI:
     def __init__(self, root):
         self.root = root
-        root.title("RemoteGamepad Server")
+        root.title("RemoteGamepad")
         root.geometry("700x520")
 
         cfg = _load_config()
@@ -258,7 +258,21 @@ class ServerGUI:
         bar = tk.Frame(root)
         bar.pack(fill=tk.X, padx=8, pady=6)
 
-        tk.Label(bar, text="Client IP:").pack(side=tk.LEFT)
+        # mode selector (client default)
+        self.mode_var = tk.StringVar(value=cfg.get("last_mode", "client"))
+        self.mode_radios = []
+        for text, val in [("Client", "client"), ("Server", "server")]:
+            rb = tk.Radiobutton(
+                bar, text=text, variable=self.mode_var, value=val,
+                command=self._on_mode_change,
+            )
+            rb.pack(side=tk.LEFT)
+            self.mode_radios.append(rb)
+
+        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+
+        self.ip_label_var = tk.StringVar()
+        tk.Label(bar, textvariable=self.ip_label_var).pack(side=tk.LEFT)
         self.ip_entry = tk.Entry(bar, width=18)
         self.ip_entry.pack(side=tk.LEFT, padx=4)
         self.ip_entry.insert(0, cfg.get("last_ip", ""))
@@ -286,14 +300,24 @@ class ServerGUI:
         nb.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
         self.nb = nb
 
-        self.diag_tab  = ProcessTab(nb,        "Diagnostics",  root)
-        self.video_tab = ProcessTab(nb,        "Video Sender", root)
-        self.ctrl_tab  = BatchedProcessTab(nb, "Controller",   root)
+        self.diag_tab  = ProcessTab(nb,        "Diagnostics", root)
+        self.video_tab = ProcessTab(nb,        "",            root)
+        self.ctrl_tab  = BatchedProcessTab(nb, "Controller",  root)
 
         root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._on_mode_change()   # set labels/titles for initial mode
         self._set_status("Ready")
 
     # ── actions ───────────────────────────────────────────────────────────────
+
+    def _on_mode_change(self):
+        mode = self.mode_var.get()
+        if mode == "client":
+            self.ip_label_var.set("Server IP:")
+            self.nb.tab(1, text="Video Receiver")
+        else:
+            self.ip_label_var.set("Client IP:")
+            self.nb.tab(1, text="Video Sender")
 
     def _start(self):
         ip = self.ip_entry.get().strip()
@@ -301,15 +325,18 @@ class ServerGUI:
             self.diag_tab.append("Invalid IP address.\n")
             self.nb.select(0)
             return
-        _save_config({"last_ip": ip})
+        mode = self.mode_var.get()
+        _save_config({"last_ip": ip, "last_mode": mode})
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
         self.ip_entry.config(state=tk.DISABLED)
+        for rb in self.mode_radios:
+            rb.config(state=tk.DISABLED)
         run_diag = self.diag_var.get()
         self.nb.select(0 if run_diag else 1)
-        threading.Thread(target=self._sequence, args=(ip, run_diag), daemon=True).start()
+        threading.Thread(target=self._sequence, args=(ip, mode, run_diag), daemon=True).start()
 
-    def _sequence(self, ip, run_diag):
+    def _sequence(self, ip, mode, run_diag):
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
@@ -317,12 +344,14 @@ class ServerGUI:
         def log(msg):
             self.root.after(0, lambda m=msg: self.diag_tab.append(m))
 
+        role = "CLIENT" if mode == "client" else "SERVER"
+
         # ── 1. diagnostics (optional, blocking) ──────────────────────────────
         if run_diag:
             self._set_status("Running diagnostics…")
             diag = subprocess.Popen(
                 ["powershell.exe", "-ExecutionPolicy", "Bypass", "-File",
-                 os.path.join(SCRIPT_DIR, "network_diagnostics.ps1"), ip, "SERVER"],
+                 os.path.join(SCRIPT_DIR, "network_diagnostics.ps1"), ip, role],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 stdin=subprocess.PIPE, encoding="utf-8", bufsize=1,
                 creationflags=CREATE_NO_WINDOW,
@@ -336,34 +365,60 @@ class ServerGUI:
                 self.root.after(0, self._re_enable)
                 return
 
-            log("\nDiagnostics passed. Launching server processes…\n")
+            log(f"\nDiagnostics passed. Launching {mode} processes…\n")
         else:
             log("Diagnostics skipped.\n")
 
-        # ── kill orphaned processes still holding server ports ────────────────
-        for port, label in [(5005, "controller (port 5005)"),
-                            (5007, "video ACK listener (port 5007)")]:
-            for pid in _kill_port_holder(port):
-                log(f"Killed orphaned process PID {pid} holding {label}\n")
-
-        # ── 2. video sender ───────────────────────────────────────────────────
         self._set_status("Running")
-        video = subprocess.Popen(
-            [PYTHON, os.path.join(SCRIPT_DIR, "video_udp_sender.py"), ip],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            stdin=subprocess.PIPE, encoding="utf-8", bufsize=1,
-            env=env, creationflags=CREATE_NO_WINDOW,
-        )
-        self.video_tab.attach(video)
 
-        # ── 3. controller receiver ────────────────────────────────────────────
-        ctrl = subprocess.Popen(
-            [PYTHON, os.path.join(SCRIPT_DIR, "controller_udp_receiver.py")],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            stdin=subprocess.PIPE, encoding="utf-8", bufsize=1,
-            env=env, creationflags=CREATE_NO_WINDOW,
-        )
-        self.ctrl_tab.attach(ctrl)
+        if mode == "client":
+            # ── kill orphaned processes holding client ports ──────────────────
+            for port, label in [(5006, "video receiver (port 5006)")]:
+                for pid in _kill_port_holder(port):
+                    log(f"Killed orphaned process PID {pid} holding {label}\n")
+
+            # ── video receiver ────────────────────────────────────────────────
+            video = subprocess.Popen(
+                [PYTHON, os.path.join(SCRIPT_DIR, "video_receiver.py"), ip],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                stdin=subprocess.PIPE, encoding="utf-8", bufsize=1,
+                env=env, creationflags=CREATE_NO_WINDOW,
+            )
+            self.video_tab.attach(video)
+
+            # ── controller sender ─────────────────────────────────────────────
+            ctrl = subprocess.Popen(
+                [PYTHON, os.path.join(SCRIPT_DIR, "controller_udp_sender.py"), ip],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                stdin=subprocess.PIPE, encoding="utf-8", bufsize=1,
+                env=env, creationflags=CREATE_NO_WINDOW,
+            )
+            self.ctrl_tab.attach(ctrl)
+
+        else:
+            # ── kill orphaned processes still holding server ports ────────────
+            for port, label in [(5005, "controller (port 5005)"),
+                                (5007, "video ACK listener (port 5007)")]:
+                for pid in _kill_port_holder(port):
+                    log(f"Killed orphaned process PID {pid} holding {label}\n")
+
+            # ── video sender ──────────────────────────────────────────────────
+            video = subprocess.Popen(
+                [PYTHON, os.path.join(SCRIPT_DIR, "video_udp_sender.py"), ip],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                stdin=subprocess.PIPE, encoding="utf-8", bufsize=1,
+                env=env, creationflags=CREATE_NO_WINDOW,
+            )
+            self.video_tab.attach(video)
+
+            # ── controller receiver ───────────────────────────────────────────
+            ctrl = subprocess.Popen(
+                [PYTHON, os.path.join(SCRIPT_DIR, "controller_udp_receiver.py")],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                stdin=subprocess.PIPE, encoding="utf-8", bufsize=1,
+                env=env, creationflags=CREATE_NO_WINDOW,
+            )
+            self.ctrl_tab.attach(ctrl)
 
         self.root.after(0, lambda: self.nb.select(1))
 
@@ -393,6 +448,8 @@ class ServerGUI:
         self.start_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
         self.ip_entry.config(state=tk.NORMAL)
+        for rb in self.mode_radios:
+            rb.config(state=tk.NORMAL)
 
     _STATUS = {
         "Ready":                   ("○  Ready",               "#888888"),
@@ -408,7 +465,7 @@ class ServerGUI:
         def _apply():
             self.status_var.set(label)
             self.status_label.config(fg=color)
-            self.root.title(f"{title_dot}RemoteGamepad Server")
+            self.root.title(f"{title_dot}RemoteGamepad")
         self.root.after(0, _apply)
 
 
