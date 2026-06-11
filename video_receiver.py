@@ -117,10 +117,15 @@ try:
         try:
             data, addr = sock.recvfrom(65536)  # blocks up to 0.1s
         except socket.timeout:
-            if known_ack_addr is not None:
-                _now = time.perf_counter()
-                if _now - max(last_frame_time, last_heartbeat_time) >= HEARTBEAT_INTERVAL:
+            _now = time.perf_counter()
+            if _now - max(last_frame_time, last_heartbeat_time) >= HEARTBEAT_INTERVAL:
+                if known_ack_addr is not None:
                     sock.sendto(b'HELO', (known_ack_addr[0], UDP_PORT))
+                    last_heartbeat_time = _now
+                elif _sender_ip:
+                    # No frame received yet — keep punching the NAT hole so the
+                    # sender can discover our external address once it's ready.
+                    sock.sendto(b'HELO', (_sender_ip, UDP_PORT))
                     last_heartbeat_time = _now
             if pump_events():
                 break

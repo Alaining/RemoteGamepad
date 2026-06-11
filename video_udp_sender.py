@@ -216,6 +216,22 @@ ack_sock.settimeout(ACK_TIMEOUT)
 # reveals its NAT-mapped external port, which we must use instead.
 video_dest = (ip, UDP_PORT)
 
+# Over the internet the receiver must punch a NAT hole (by sending HELO here)
+# before frames can reach it.  Wait briefly so video_dest is set correctly
+# before the first frame goes out.  On LAN, no HELO arrives and we proceed.
+print("Waiting up to 5 s for receiver to connect...")
+sock.settimeout(5.0)
+try:
+    while True:
+        _d, _a = sock.recvfrom(16)
+        if _d == b'HELO':
+            video_dest = _a
+            print(f"Receiver connected from {_a[0]}:{_a[1]}")
+            break
+except socket.timeout:
+    print(f"No HELO yet; streaming to {ip}:{UDP_PORT} (fine for LAN, or receiver will connect shortly).")
+sock.settimeout(None)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 10 — Latency metric state
 # ─────────────────────────────────────────────────────────────────────────────
