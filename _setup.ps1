@@ -53,10 +53,16 @@ if (-not $pythonExe) {
         exit 1
     }
 
-    winget install Python.Python.3 --scope user --silent --accept-package-agreements --accept-source-agreements
+    $pythonIds = @("Python.Python.3.13", "Python.Python.3.12", "Python.Python.3.11", "Python.Python.3.10")
+    $wingetOk = $false
+    foreach ($pkgId in $pythonIds) {
+        Write-Host "      Trying $pkgId..." -ForegroundColor Yellow
+        winget install --id $pkgId --scope user --silent --accept-package-agreements --accept-source-agreements
+        if ($LASTEXITCODE -eq 0) { $wingetOk = $true; break }
+    }
 
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "      winget install failed (exit code $LASTEXITCODE)." -ForegroundColor Red
+    if (-not $wingetOk) {
+        Write-Host "      winget could not install Python automatically." -ForegroundColor Red
         Write-Host "      Install Python 3 from https://www.python.org/downloads/ then re-run the installer." -ForegroundColor White
         exit 1
     }
