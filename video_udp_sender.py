@@ -18,9 +18,9 @@ from collections import deque  # fixed-length rolling buffer for latency statist
 UDP_PORT = 5006
 ACK_PORT = 5007         # client sends latency ACKs back to this port
 ACK_TIMEOUT = 0.15      # seconds to wait per ACK stage; 150ms covers internet RTT (LAN typically <10ms so still fast)
-FRAMERATE = 165         # capture and stream frame rate
-JPEG_QUALITY = 20       # 2=best/largest, 31=worst/smallest (ffmpeg -q:v scale)
-HEIGHT = 360            # stream height; width auto-scaled to maintain aspect ratio
+FRAMERATE = 90         # capture and stream frame rate
+JPEG_QUALITY = 15       # 2=best/largest, 31=worst/smallest (ffmpeg -q:v scale)
+HEIGHT = 480            # stream height; width auto-scaled to maintain aspect ratio
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 3 — JPEG frame delimiters
